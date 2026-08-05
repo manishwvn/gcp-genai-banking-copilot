@@ -671,6 +671,7 @@ collection.add({
 2. Overlap is required, not optional — without it, a fact split across a chunk boundary (e.g., a sentence naming a dollar figure) can lose its subject or context entirely.
 3. Token counting via char/4 is a rough estimate, not exact — real tokenizers vary by ~20% depending on content (numbers, punctuation tokenize differently than prose).
 4. Firestore document size limit is 1MB — chunks should stay well under that (50KB or less is a safe ceiling); at 800 tokens (~3.2KB) per chunk this is a non-issue, but watch for pathological documents with very sparse sentence boundaries.
+5. **New GCP project ≠ ready-to-use Firestore.** Two separate setup steps are required before any client code can write: (1) enable the API — `gcloud services enable firestore.googleapis.com --project=<project>`, and (2) create the actual database — `gcloud firestore databases create --location=us-central1 --type=firestore-native --project=<project>` (a project can have the API enabled with zero databases). Skipping either gives a `403 PermissionDenied: SERVICE_DISABLED` error that reads like a permissions/IAM problem but is actually a provisioning problem. Both are one-time, per-project setup — not needed again once done.
 
 ---
 
