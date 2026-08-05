@@ -606,6 +606,74 @@ gcp-genai-banking/
 
 ---
 
+## Deprecation & Migration Notes
+
+**`google-generativeai` deprecated upstream (as of Aug 2026).** Google recommends `google-genai` as replacement SDK.
+
+- Still works, no breakage — but no more updates/fixes coming.
+- Plan: migrate imports and calls to `google-genai` before `embeddings.py` gets its heavy Phase 2 implementation.
+- Low-effort swap (API is similar) — better done early before more code depends on old package.
+
+---
+
+## Document Ingestion & Chunking Strategy
+
+**What:** Chunking splits large documents (10-Ks, transcripts) into smaller, retrieval-sized text pieces before embedding.
+
+**Why:** Embeddings represent semantic meaning of a fixed-size piece of text. A full 10-K is too broad — the embedding would blur together dozens of unrelated topics (risk factors, financials, business description), making similarity search useless. Small, focused chunks let retrieval pull back just the passage relevant to a query.
+
+**Key concepts:**
+- **Chunk size** — target ~800 tokens per chunk (tunable). Big enough to preserve context, small enough for precise retrieval.
+- **Overlap** — ~100 tokens shared between consecutive chunks, so a sentence split across a chunk boundary doesn't lose surrounding context.
+- **Sentence boundaries** — split on `. ` / `! ` / `? ` (regex lookbehind) rather than mid-sentence, so chunks read as coherent text.
+- **Token counting** — no tokenizer needed for a rough split; approximate 1 token ≈ 4 characters. Good enough for chunk sizing, not exact.
+
+**Snippets:**
+
+```python
+# PDF -> text
+import pdfplumber
+
+def read_pdf_text(filepath: str) -> str:
+    pages = []
+    with pdfplumber.open(filepath) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+    return "\n\n".join(pages)
+```
+
+```python
+# sentence-boundary chunking with overlap
+import re
+
+sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+# accumulate sentences into ~chunk_size*4 chars, carry last ~overlap*4 chars into next chunk
+```
+
+```python
+# Firestore chunk document
+collection.add({
+    "text": chunk,
+    "source": source_name,
+    "source_url": f"local://{filepath}",
+    "page_number": 0,
+    "chunk_index": index,
+    "created_at": datetime.now(timezone.utc),
+})
+```
+
+**ELI5:** Chunking is like cutting a book into chapters so you can find the right one quickly, instead of handing someone the whole book and asking them to guess which page has the answer.
+
+**Gotchas:**
+1. PDF layout varies wildly — tables, multi-column layouts, and scanned/OCR'd pages can extract as garbled or empty text. Always spot-check extracted text.
+2. Overlap is required, not optional — without it, a fact split across a chunk boundary (e.g., a sentence naming a dollar figure) can lose its subject or context entirely.
+3. Token counting via char/4 is a rough estimate, not exact — real tokenizers vary by ~20% depending on content (numbers, punctuation tokenize differently than prose).
+4. Firestore document size limit is 1MB — chunks should stay well under that (50KB or less is a safe ceiling); at 800 tokens (~3.2KB) per chunk this is a non-issue, but watch for pathological documents with very sparse sentence boundaries.
+
+---
+
 ## To Be Added
 
 - **IAM Deep-dive (service accounts, key management)**
