@@ -408,6 +408,62 @@ AI Studio is like **having a free talking oracle at your fingertips.**
 
 ---
 
+## GCP Always-Free vs. AI Studio Free Tier — Separate Projects Required
+
+### What It Is
+GCP's Always-Free tier and Google AI Studio's Gemini API free tier are *independent quota systems*, not just different rate limits. Critically, **billing account status determines which tier a Gemini API key falls into** — a key created under a project with billing linked automatically gets promoted to Tier 1/Postpay, even if you never use it.
+
+### Why It's Used Here
+Our app needs GCP Always-Free services (Firestore, Storage, Cloud Run) which require a billing account linked to the project. But that same billing link automatically promotes any Gemini API key created under that project to paid tier. To stay on free tier for embeddings, we maintain two projects.
+
+### Key Concepts
+
+**Billing tier determination:**
+- **Free tier:** Gemini API key created under a project with NO billing account attached.
+- **Tier 1 (Postpay):** Gemini API key created under a project WITH billing account linked.
+- This is automatic — there is no "opt-out" setting on the key itself or in the AI Studio UI.
+
+**Why separate projects?**
+- Main project (`gcp-genai-banking`): Has billing linked, enables GCP Always-Free services (Firestore, Storage, Cloud Run).
+- Secondary project (`gcp-genai-llm-free`): No billing account, never attach one — this is where the free-tier Gemini key lives.
+- Active project stays gcp-genai-banking; the secondary project is only used to hold the API key (can be referenced with `--project` flag or in code).
+
+### Implementation Snippets
+
+**Create billing-free project:**
+```bash
+gcloud projects create gcp-genai-llm-free --name="Gemini API Free Tier"
+# Do NOT link billing to this project
+```
+
+**Verify no billing is linked:**
+```bash
+gcloud billing projects list
+# gcp-genai-llm-free should NOT appear in the output
+```
+
+**Create free-tier API key (in the secondary project):**
+```bash
+# In AI Studio (ai.google.dev), when creating the API key, select gcp-genai-llm-free from the project dropdown
+# Verify "Free tier" badge appears (Tier 1 / Postpay would appear if you accidentally used gcp-genai-banking)
+```
+
+### ELI5 Explanation
+
+It's like **having two mailboxes — one for bills (GCP services) and one that's permanently unlisted (Gemini API free key).**
+- You can't slap a "do not bill" sticker on the main mailbox and expect it to work; the postman follows project-level rules, not stickers.
+- So you rent a second mailbox that was never on any subscription list in the first place, and use that one for the free service.
+- Both projects are yours; you just keep them separate by design.
+
+### Common Gotchas
+
+1. **"Buy credits" prompt is not a status check.** If you click into an API key's billing settings in AI Studio and see a "Buy prepaid credits" button, that's a *real* purchase flow — not informational. The key is on Tier 1 (postpay). Close the dialog; don't proceed. Create a new key under the billing-free project instead.
+2. **Billing link is project-level, not per-API-key.** You cannot "un-promote" a key created under a billing-linked project by changing its settings — it's locked to Tier 1 because of the project. Delete the key and create a new one under the billing-free project.
+3. **Default project matters.** If your `gcloud` default is set to `gcp-genai-banking`, and you create an API key in AI Studio without explicitly selecting a project, it defaults to gcp-genai-banking and lands on Tier 1. Always verify the project selector in AI Studio before generating a key.
+4. **No need to switch active projects constantly.** The secondary project exists only to host the API key; your Cloud Run app (deployed from gcp-genai-banking) pulls the key from .env and uses it to call Gemini. No CLI switching needed.
+
+---
+
 ## Cloud Run
 
 ### What It Is
@@ -759,5 +815,5 @@ vector = response.embeddings[0].values  # list[float], length 768
 
 ---
 
-**Last updated:** 2026-08-05
+**Last updated:** 2026-08-05 (Component 2 completion: embedding generation, vector indexing, free-tier billing architecture)
 **Scope:** GCP_GEN_AI Banking Copilot, Phase 1 (Filings RAG MVP)
