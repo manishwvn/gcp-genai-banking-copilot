@@ -1,0 +1,12 @@
+#!/bin/sh
+# Post-commit reminder hook. Prints only — no file writes, no API calls, no auto-commits.
+
+msg=$(git log -1 --pretty=%B)
+
+if echo "$msg" | grep -qi '\[component-done\]'; then
+    echo "═══════════════════════════════════════════"
+    echo " COMPONENT/PHASE MARKED DONE"
+    echo " → Run the CLAUDE.md + learnings.md update prompt"
+    echo "   in the doc-updates Claude Code session now."
+    echo "═══════════════════════════════════════════"
+fi

@@ -16,6 +16,7 @@ cd GCP_GEN_AI
 uv venv
 source .venv/bin/activate
 uv sync
+git config core.hooksPath .githooks
 ```
 
 Set the following in `.env`:
