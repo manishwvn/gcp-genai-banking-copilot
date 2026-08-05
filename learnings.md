@@ -675,6 +675,75 @@ collection.add({
 
 ---
 
+## Embedding Generation & Vector Indexing
+
+**What:** Converting text (a chunk of a filing) into a dense vector — a fixed-length list of floats — that numerically represents its meaning.
+
+**Why:** Enables retrieval by meaning, not keyword matching. A query about "credit risk exposure" should match a chunk discussing "loan default risk" even with zero shared words, because their embeddings land close together in vector space.
+
+**Key concepts:**
+- **Embedding dimension** — fixed length of the vector (768 here). Firestore's vector index is dimension-locked; the index and every stored vector must match.
+- **Idempotent re-runs matter** — embedding calls cost API quota (rate-limited on free tier). `embed_filings.py` checks for an existing `embedding` field before calling the API, so re-running the script after a partial failure or adding new chunks doesn't burn quota re-embedding chunks already done.
+- **Rate limiting** — Gemini free tier caps requests per minute at the project level. A fixed delay between calls (5 sec here, conservative vs. ~4 sec at 15 RPM) avoids 429s outright rather than relying on retry-after-failure.
+- **Vector index requirement** — Firestore does not auto-index vector fields for KNN search. A composite index must be explicitly created (`gcloud firestore indexes composite create ...`) before `find_nearest` queries will work; without it, queries fail even though the data is there.
+
+**Snippets:**
+
+```python
+# embed_text — retry with exponential backoff, fails loudly after MAX_RETRIES
+def embed_text(text: str) -> list:
+    client = _get_client()
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=text,
+                config=types.EmbedContentConfig(output_dimensionality=768),
+            )
+            return response.embeddings[0].values
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
+            else:
+                raise RuntimeError(f"embed_text failed after {MAX_RETRIES} attempts: {e}") from e
+```
+
+```bash
+# Firestore vector composite index — required before find_nearest works
+gcloud firestore indexes composite create \
+  --collection-group=filings_chunks \
+  --query-scope=COLLECTION \
+  --field-config field-path=embedding,vector-config='{"dimension":"768", "flat": "{}"}' \
+  --database="(default)"
+```
+
+```python
+# google-generativeai (deprecated) -> google-genai (current)
+# old: import google.generativeai as genai; genai.configure(api_key=...)
+# new:
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=api_key)
+response = client.models.embed_content(
+    model="gemini-embedding-001",
+    contents=text,
+    config=types.EmbedContentConfig(output_dimensionality=768),
+)
+vector = response.embeddings[0].values  # list[float], length 768
+```
+
+**ELI5:** Embeddings are like giving every sentence a GPS coordinate in "meaning-space" — sentences about similar topics end up near each other, so finding "similar meaning" becomes finding "nearby coordinates."
+
+**Gotchas:**
+1. `google-generativeai` is deprecated — use `google-genai` (`from google import genai`). Client instantiation and call shape both changed (`genai.Client(api_key=...)`, `client.models.embed_content(...)`), not just the import path.
+2. `gemini-embedding-001` defaults to 3072 dimensions — pass `config=types.EmbedContentConfig(output_dimensionality=768)` explicitly to match Firestore's index dimension. `text-embedding-004` (referenced in earlier plans) is no longer served by the API — `ListModels` is the source of truth for current model names.
+3. The vector index must exist *before* `find_nearest` queries work — Firestore doesn't build it implicitly on first query for vector fields (unlike some scalar-field indexes). Creating it is async and can take a few minutes; check with `gcloud firestore indexes composite list`.
+4. Re-running embedding scripts should always skip chunks that already have an `embedding` field — free-tier rate limits (RPM) are project-wide, not per-key, so wasted re-embeds eat into the same shared quota as everything else hitting the project.
+5. `firestore.Vector` (the top-level import path documented above in the Firestore section) doesn't exist on `google-cloud-firestore==2.27.0` — the installed version doesn't re-export `Vector` at the package root. Actual working import: `from google.cloud.firestore_v1.vector import Vector`. Likely cause: Google's docs/examples reflect a different client library version than what's currently pinned here — always verify with `dir(module)` or a quick import check rather than trusting doc snippets verbatim against an installed version.
+
+---
+
 ## To Be Added
 
 - **IAM Deep-dive (service accounts, key management)**
