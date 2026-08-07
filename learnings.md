@@ -859,21 +859,404 @@ citations = [
 
 ---
 
+## Web APIs & HTTP Fundamentals
+
+### What It Is
+
+An **API** (Application Programming Interface) is a defined contract for software-to-software requests. **HTTP** is the protocol used by web APIs — it defines methods (GET, POST, PUT, DELETE, etc.), endpoints (URLs), request/response bodies (data formats), and status codes (responses: 200 OK, 404 Not Found, 429 Too Many Requests, 500 Server Error, etc.). 
+
+### Why It's Used Here
+
+The `rag_query()` Python function works locally in Python only. To expose it beyond a single developer's laptop — to a browser, a curl command, a mobile app, or a frontend UI — we need an HTTP interface. That interface will be a web API.
+
+### Key Concepts
+
+**HTTP Methods:**
+- **GET** — retrieve data, safe (no side effects), idempotent (same result each time).
+- **POST** — submit data to create/change state, causes side effects, not idempotent.
+- **PUT/PATCH** — update existing resources.
+- **DELETE** — remove resources.
+
+**Request/Response Bodies:**
+- Request body contains data sent to the server (usually JSON).
+- Response body contains data sent back (status code + response body, e.g., answer + citations).
+
+**Status Codes:**
+- **2xx** (200, 201) — success.
+- **4xx** (400 bad request, 401 unauthorized, 404 not found, 429 rate limited) — client error.
+- **5xx** (500 internal server error) — server error.
+
+### Implementation Snippets
+
+**Conceptual HTTP request:**
+```
+POST /query HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+
+{
+  "question": "What are ACME's main financial risks?"
+}
+```
+
+**Response:**
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "answer": "...",
+  "answer_grounded": true,
+  "citations": [...]
+}
+```
+
+### ELI5 Explanation
+
+Think of an HTTP API like a **restaurant transaction:**
+- You walk in, look at a **menu (endpoints)** — fixed options like "GET /menu" or "POST /order".
+- You place an order with details (request body) — "I want a sandwich, extra pickles."
+- The kitchen receives it, cooks, and sends back a plate (response) — "Here's your sandwich" (200 OK) or "We're out of pickles" (400 Bad Request).
+- You never see the kitchen internals; you only use the menu and the plate that comes back.
+
+### Common Gotchas
+
+1. **Endpoint design matters.** `/api/query` returning different data per HTTP method (GET = list queries, POST = submit new query) uses HTTP correctly; non-idiomatic designs (everything POST, ignoring method semantics) work but confuse future readers.
+2. **Status codes are semantic.** Return 201 Created for POST that creates, 404 for a missing resource, 429 for rate-limit, not just 200 for everything. Clients parse these.
+3. **Request/response validation is the boundary.** Never trust incoming JSON — validate shape, types, required fields. Outgoing response should also be validated before serializing.
+
+---
+
+## FastAPI Framework
+
+### What It Is
+
+**FastAPI** is a Python web framework for building HTTP APIs quickly. It automatically handles HTTP routing (mapping endpoints to Python functions), request parsing (converting JSON to Python objects), response serialization (converting Python objects back to JSON), and generates interactive API documentation (OpenAPI/Swagger at `/docs` and `/redoc`).
+
+### Why It's Used Here
+
+Without a framework, building an HTTP endpoint requires low-level HTTP plumbing (socket handling, parsing headers, serializing responses). FastAPI handles all that. Beyond convenience, it provides **automatic request/response validation via Pydantic models** — define the shape of incoming data once, and invalid requests are rejected before hitting your code. For an interview demo, the auto-generated `/docs` (interactive Swagger UI) is a polished artifact that showcases the API without writing a separate spec.
+
+### Key Concepts
+
+**Pydantic Models:**
+- Python dataclasses-like objects that validate data shape, types, and constraints.
+- `@app.post("/query", response_model=QueryResponse)` means: accept a `QueryRequest` body, run your function, return a `QueryResponse` — FastAPI validates both.
+
+**Decorators:**
+- `@app.get(...)`, `@app.post(...)` map HTTP methods and paths to Python functions.
+
+**Dependency Injection:**
+- FastAPI can pass database connections, config, logged-in user, etc. as function arguments — framework handles plumbing.
+
+### Implementation Snippets
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+app = FastAPI(title="Banking Copilot API")
+
+class QueryRequest(BaseModel):
+    question: str
+
+class QueryResponse(BaseModel):
+    answer: str
+    answer_grounded: bool
+    citations: list
+
+@app.post("/query", response_model=QueryResponse)
+async def query_endpoint(req: QueryRequest) -> QueryResponse:
+    result = rag_query(req.question)
+    return QueryResponse(
+        answer=result["answer"],
+        answer_grounded=result["answer_grounded"],
+        citations=result["citations"],
+    )
+
+# Run: uvicorn main:app --reload
+# Docs: http://localhost:8000/docs
+```
+
+### ELI5 Explanation
+
+FastAPI is like a **restaurant-in-a-box**. You don't build walls and install a kitchen yourself (HTTP plumbing); they're pre-built. You write recipes (endpoint functions). The framework automatically prints a menu card for guests (Swagger docs at `/docs`) — no separate doc writing needed.
+
+### Common Gotchas
+
+**TBD** — to be filled in after Component 5 build if framework-specific quirks surface.
+
+---
+
+## Containers & Docker
+
+### What It Is
+
+A **container** bundles an application, its code, all runtime dependencies (libraries, Python interpreter, system tools), and configuration into a single portable unit. It's lighter than a **VM** (which virtualizes a full OS kernel and hardware, weighs GB) — containers share the host OS kernel, are lightweight (MB), and start in milliseconds.
+
+A **Dockerfile** is a text file with instructions to build a container image. A **container image** is a static, built snapshot (like a `.jar` file). A running **container** is a live instance of that image (like a running JVM process).
+
+### Why It's Used Here
+
+Cloud Run runs containers, not raw Python files. Your laptop has Python 3.11, numpy, google-cloud-firestore, etc. installed. Cloud Run's servers don't. A container brings those dependencies along — "this app works everywhere the container engine is installed" solves the "works on my machine" problem.
+
+### Key Concepts
+
+**Dockerfile Instructions:**
+- **FROM** — base image (e.g., `python:3.11-slim`), provides the OS and language runtime.
+- **COPY** — copy files from local machine into the image (e.g., `COPY src/ /app/src/`).
+- **RUN** — execute a command during build (e.g., `RUN pip install -r requirements.txt`).
+- **EXPOSE** — declare which port the app listens on (documentation; doesn't do networking).
+- **CMD** — default command to run when container starts (e.g., `CMD ["python", "main.py"]`).
+
+**Image vs. Container:**
+- Image = class (static, reusable, stored in a registry).
+- Container = instance (live, temporary, tied to a running process).
+
+### Implementation Snippets
+
+```dockerfile
+# Conceptual Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+**Build locally (not yet done; for reference):**
+```bash
+docker build -t banking-copilot:latest .
+docker run -p 8000:8000 banking-copilot:latest
+```
+
+### ELI5 Explanation
+
+A container is like an **IKEA-furniture-in-a-box shipment**. Instead of assuming the recipient owns a drill, screwdriver set, and wood stain, you ship everything inside the box — parts, tools, finishing supplies. The recipient doesn't need *their* tools; the box has everything. Cloud Run is the delivery company — you give it a box (container image), it runs whatever's inside (the furniture gets assembled).
+
+### Common Gotchas
+
+**TBD** — to be filled in after Component 5 Docker build if build-time or runtime surprises surface.
+
+---
+
+## Cloud Run
+
+### What It Is
+
+**Cloud Run** is a serverless container hosting service. You provide a container image; Cloud Run runs it on demand, exposes a public HTTPS URL, and manages scaling — no servers to manage, no instances to SSH into.
+
+### Why It's Used Here
+
+Fits the $0-spend goal:
+- **Scales to zero.** No requests = no running containers = no charges. Idle cost is zero.
+- **Always-Free tier:** 2M requests/month free, 360K CPU-seconds/month free. Enough for a non-production interview demo.
+- **Container is portable.** Same image runs locally (Docker) or on Cloud Run (no code changes).
+
+### Key Concepts
+
+**Cold Start:** First request after idle spins up a fresh container instance (slower, ~1–5 sec). Subsequent requests within a few seconds reuse the warm instance (fast).
+
+**Auto-Scaling:** Multiple instances under load; Cloud Run shuts down unused instances automatically.
+
+**`gcloud run deploy`:** Deploys a service. With `--source=.`, Cloud Build auto-builds the image from local Dockerfile in the background.
+
+**Service Account Attachment:** Cloud Run can run with a specific service account's identity (no key file involved — the service account is attached to the Cloud Run config). Code inside the container inherits that identity for GCP API calls.
+
+### Implementation Snippets
+
+**Deploy from local source (minimal example, not yet run):**
+```bash
+gcloud run deploy banking-copilot \
+  --source=. \
+  --platform=managed \
+  --region=us-central1 \
+  --allow-unauthenticated \
+  --service-account=filings-rag-app@gcp-genai-banking.iam.gserviceaccount.com
+```
+
+This builds the image via Cloud Build, deploys to Cloud Run, attaches the service account, and returns a public HTTPS URL.
+
+### ELI5 Explanation
+
+Cloud Run is like **renting a food truck**. You don't own the truck or parking lot (no server management). You hand the company a recipe box (container image) and a phone number to call when customers arrive. The truck rolls in when it gets a call, cooks, and rolls away when the line empties. You pay per customer, not per day the truck sits idle.
+
+### Common Gotchas
+
+**TBD** — to be filled in after Component 5 deployment surfaces real gotchas (cold start impact, quotas, logging setup, etc.).
+
+---
+
+## Secret Manager
+
+### What It Is
+
+**Cloud Secret Manager** is a dedicated, version-controlled, access-controlled storage for sensitive values — API keys, credentials, database passwords, etc. Secrets are stored encrypted at rest, access is gated by IAM, and Cloud Run can inject a secret as an environment variable at container startup.
+
+### Why It's Used Here
+
+Secrets must **never** live in:
+- Git repositories (even private ones, checked into history is permanent).
+- Docker images (baked in, visible to anyone with image access).
+- `.env` files shipped with code (portable as a container, visible to container inspectors).
+
+Instead, store in Secret Manager, access via IAM, inject at runtime.
+
+### Key Concepts
+
+**Secret = named container;** `gemini-api-key` is a secret name.
+
+**Version = a specific value over time;** version 1 was the original value, version 2 is a rotated value. Supports rotation without changing code — just add a new version and update Cloud Run's reference.
+
+**IAM Access:** `roles/secretmanager.secretAccessor` grants read-only access to a specific secret for a specific identity (e.g., `filings-rag-app` service account). Even you (the user) can't read the value after creation without this role explicitly granted.
+
+### Implementation Snippets
+
+**Create a secret (one-step, as run this session):**
+```bash
+# Create secret with initial value in one command
+echo -n "[REDACTED_KEY]" | gcloud secrets create gemini-api-key --data-file=- --project=gcp-genai-banking
+
+# List versions
+gcloud secrets versions list gemini-api-key
+
+# Grant access to a service account
+gcloud secrets add-iam-policy-binding gemini-api-key \
+  --member=serviceAccount:filings-rag-app@gcp-genai-banking.iam.gserviceaccount.com \
+  --role=roles/secretmanager.secretAccessor
+```
+
+**In application code (inside Cloud Run container, after injection):**
+```python
+import os
+
+api_key = os.getenv("GEMINI_API_KEY")  # Cloud Run injects this from Secret Manager
+```
+
+**Cloud Run service deployment references the secret:**
+```bash
+gcloud run deploy banking-copilot \
+  --set-env-vars=GEMINI_API_KEY=projects/PROJECT_ID/secrets/gemini-api-key/versions/latest \
+  ...
+```
+
+### ELI5 Explanation
+
+**Secret Manager is a bank vault; local `.env` is a sticky note on the door.**
+- `.env` shipped with code: "House key location: 123 Main St." (anyone with the code has the key location).
+- Secret Manager: key stored in a vault, only people pre-approved via ID can open it, and the vault logs every access.
+- Cloud Run's secret injection: "Here's the vault access token for this service" — Cloud Run retrieves the actual value at startup, makes it available as an env var inside the container, no exposed value anywhere.
+
+### Common Gotchas & Security Incidents
+
+**Real incident this session — API key exposure in chat:**
+During manual secret creation, the gemini-api-key value was pasted into an AI chat conversation as part of a shell command example, even though the intent was to keep it out of context by running commands manually/locally. **Once a credential appears in any conversation history (including AI chat), treat it as compromised** — recovery assumes active use of the credential elsewhere, and the history (even a deleted message) is not guaranteed to be unseen.
+
+**Response and mitigation:**
+1. Rotated the key in AI Studio (invalidated the old value at the source).
+2. Added the new value as secret version 2 via `gcloud secrets versions add gemini-api-key ...`.
+3. **Destroyed** the compromised version 1 via `gcloud secrets versions destroy 1 --secret=gemini-api-key` — destroy is irreversible and actually deletes the value data, vs. `disable` which only deactivates but keeps it recoverable. Destroy is the correct response to a leaked value.
+4. **Lesson:** When sharing a command that embeds a secret value in visible text (even if the underlying execution is manual/local), redact the value in anything shown to another party, including an AI assistant. Example: show `echo -n "[REDACTED_KEY]" | gcloud secrets versions add ...` in the chat, run the actual value locally.
+
+---
+
+## Cloud Run Service Account Identity (vs. local key-file auth)
+
+### What It Is
+
+In Components 1–4 (local Python development), code explicitly loads a service account key file (`filings-rag-app-key.json`) to authenticate to GCP APIs. **Cloud Run's attached-identity model works differently:** the service account is attached to the Cloud Run service configuration itself. Code running inside automatically authenticates as that identity — **no key file involved anywhere.** The Cloud Run environment provides the credentials.
+
+### Why It's Used Here (Deployment Context)
+
+**Local auth (Components 1–4):** Key file is portable and explicit — the file is the credential. Risk: files get leaked (committed to git, exposed in a screenshot, copied to untrusted machines).
+
+**Cloud Run auth:** Identity is bound to the service configuration, not a portable file. Access is revocable via IAM, independent of whether a key exists. Much harder to leak because there's no credential file to lose.
+
+### Key Concepts
+
+**Same service account, two contexts:**
+- Local: code loads `filings-rag-app-key.json` explicitly via `credentials.from_service_account_file()`.
+- Cloud Run: service account is attached to the Cloud Run service; code uses `google.auth.default()` which fetches credentials from the Cloud Run environment automatically.
+
+**No code changes needed.** `google.auth.default()` is the pattern for both — it looks for credentials in the environment first (Cloud Run provides them there), then falls back to a local key file if available. Same code, different credential source per context.
+
+**Roles are shared.** `filings-rag-app` already has `roles/datastore.user`, `roles/storage.objectViewer`, and `roles/secretmanager.secretAccessor` — these roles work whether the account authenticates via a key file (locally) or via Cloud Run's attached identity. No new service account needed.
+
+### Implementation Snippets
+
+**Local (components 1–4, using key file):**
+```python
+from google.auth import credentials
+from google.cloud import firestore
+
+creds = credentials.from_service_account_file("filings-rag-app-key.json")
+db = firestore.Client(credentials=creds, project="gcp-genai-banking")
+```
+
+**Cloud Run (components 5+, using attached identity):**
+```python
+from google.cloud import firestore
+
+# google.auth.default() checks Cloud Run environment first
+db = firestore.Client(project="gcp-genai-banking")
+# Credentials are fetched automatically from the Cloud Run metadata service
+```
+
+**Same code path works for both:**
+```python
+# This pattern works in both contexts
+import google.auth
+
+credentials, project = google.auth.default()
+# On Cloud Run: credentials fetched from environment.
+# Locally: credentials fetched from ~/.config/gcloud/ or a key file in the path.
+```
+
+**Deployment command attaches the service account:**
+```bash
+gcloud run deploy banking-copilot \
+  --source=. \
+  --service-account=filings-rag-app@gcp-genai-banking.iam.gserviceaccount.com \
+  ...
+```
+
+### ELI5 Explanation
+
+**Local key-file auth = carrying a physical badge.**
+- Badge is your credential — it's portable, you can use it anywhere it's recognized.
+- Risk: lose the badge (or a copy gets stolen), anyone can impersonate you.
+
+**Cloud Run's attached identity = a building that recognizes you by which office you're in.**
+- No badge needed — the building knows "this container is running in office 5, so it's the filings-rag-app identity."
+- Access is tied to location/context, not a portable item.
+- You change jobs (rotate credentials), the building automatically starts checking a different office's access list — no badge handoff needed.
+
+### Common Gotchas
+
+1. **`google.auth.default()` order matters for local dev.** It checks (in order): Google Cloud SDK credentials, then `GOOGLE_APPLICATION_CREDENTIALS` env var, then application default credentials. If multiple are set, first match wins. For local testing, explicitly set `GOOGLE_APPLICATION_CREDENTIALS=path/to/filings-rag-app-key.json` to avoid surprise auth failures.
+2. **Cloud Run doesn't use key files.** Attempting to reference a key file path inside a container fails (the file isn't there). Always use `google.auth.default()` for Cloud Run code; it checks the environment automatically.
+3. **Secret Manager access also uses attached identity.** When Cloud Run injects a secret as an env var, it's fetching the secret on behalf of the attached service account. That account must have `roles/secretmanager.secretAccessor` on that specific secret — no fallback if it doesn't.
+
+---
+
 ## To Be Added
 
-- **IAM Deep-dive (service accounts, key management)**
 - **Firestore Indexing & Query Planning**
-- **Cloud Run Deployment, Secrets Injection, Logging**
 - **LangChain & LangGraph Patterns**
 - **Gemini Function Calling**
-- **Vector Embeddings: Concepts & Dimensions**
 - **RAG Evaluation & Grounding Checks**
 - **LangGraph Verification Agents (Hallucination Mitigation)**
 - **CI/CD & Cloud Build**
 - **Cost Monitoring & Alerts**
-- **Log full raw API exception bodies to a file on failure, not just conversation/session context** — current gotcha docs risk truncation or loss if not caught during the same session.
 
 ---
 
-**Last updated:** 2026-08-05 (Component 2 completion: embedding generation, vector indexing, free-tier billing architecture)
+**Last updated:** 2026-08-07 (Pre-Component 5 conceptual session: APIs, FastAPI, Docker, Cloud Run, Secret Manager, service account identity model)
 **Scope:** GCP_GEN_AI Banking Copilot, Phase 1 (Filings RAG MVP)

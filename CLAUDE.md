@@ -149,3 +149,28 @@ A **supervisor agent** (LangGraph, Phase 2) routes requests to the right special
 
 - **Status:** Component 4 COMPLETE and verified.
 - **Phase 1 MVP readiness:** Core retrieval + grounded RAG chain done. Next: deploy to Cloud Run, add HTTP API layer (FastAPI), integrate synthetic dataset (SEC filings corpus).
+
+### 2026-08-07 — Pre-Component 5 conceptual refresher & infrastructure setup
+
+**a) Conceptual deep-dive:** Covered foundational concepts needed before Component 5 build:
+- **APIs & HTTP fundamentals:** methods (GET/POST), endpoints, request/response bodies, status codes — needed to expose `rag_query()` beyond local Python.
+- **FastAPI framework:** HTTP routing, Pydantic request/response validation, auto-generated OpenAPI docs (`/docs`). Chosen over Flask (explicit decision made earlier, documented in Architecture Decisions).
+- **Containers & Docker:** Dockerfile anatomy (FROM/COPY/RUN/CMD), image vs. container (class vs. object). Why: "works on my machine" problem — Cloud Run's servers don't have your laptop's dependencies.
+- **Cloud Run:** serverless container hosting, scales to zero (no idle cost), Always-Free: 2M requests/month. Attached service account identity (no key file in container) vs. local key-file auth.
+- **Secret Manager:** credential storage, versioned and access-controlled. Learned: once a secret appears in any conversation/history, treat as compromised — rotate at source, add new version, destroy (not disable) the old version.
+- **Cloud Run service account identity model:** same service account (`filings-rag-app`) works for both local (key file) and Cloud Run (attached identity) contexts. Code uses `google.auth.default()` which checks environment first (Cloud Run) then falls back to local key file.
+
+**b) Security incident & response (real, this session):**
+- During manual secret creation, gemini-api-key value was pasted into an AI chat conversation as part of a command example, despite intent to keep secrets out of AI context by running commands manually.
+- **Lesson:** once a credential appears in any conversation history (including AI), treat it as compromised regardless of whether execution was manual/local.
+- **Mitigation:** rotated key in AI Studio, added new value as secret version 2 via `gcloud secrets versions add`, destroyed (not disabled) version 1 via `gcloud secrets versions destroy 1 --secret=gemini-api-key` — destroy is irreversible and actually deletes the value data, vs. disable which only deactivates but keeps it recoverable.
+- **Future practice:** when showing a command that embeds a secret value, redact the value in anything shown to another party (including AI), even if underlying execution is manual.
+
+**c) Infrastructure for Component 5 prepared:**
+- Secret Manager API enabled, `gemini-api-key` secret created (version 1, then rotated to version 2).
+- Firestore, Cloud Storage, Cloud Run, Cloud Build APIs already enabled (from Components 1–4).
+- `filings-rag-app` service account confirmed sufficient for Cloud Run deployment: already has `roles/datastore.user` (Firestore), `roles/storage.objectViewer` (Cloud Storage), and `roles/secretmanager.secretAccessor` (Secret Manager). No new service account needed.
+
+**d) Next step:** Component 5 build (FastAPI HTTP API, Dockerfile, Cloud Run deployment) not yet started, pending this doc update.
+
+- **Status:** Pre-build conceptual work complete. Infrastructure ready for Component 5.
