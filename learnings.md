@@ -800,6 +800,65 @@ vector = response.embeddings[0].values  # list[float], length 768
 
 ---
 
+## Retrieval & Grounded Generation (RAG Chain)
+
+**What:** Combining semantic retrieval (find the most relevant filing chunks for a question) with constrained generation (make the model answer only from those chunks). Two-stage pipeline: `retrieve_relevant_chunks()` embeds the question and runs `find_nearest` against Firestore; `generate_grounded_answer()` feeds the retrieved text into a tightly-scoped prompt and attaches citations in code.
+
+**Why:** Grounding prevents hallucination. Left alone, an LLM will answer confidently from parametric knowledge even when the real filing says nothing on the topic — dangerous in a banking-domain interview demo. Two separate guardrails matter here: (1) a prompt instruction telling the model to refuse when the context doesn't cover the question, and (2) citations attached programmatically from the actual retrieved chunk metadata, not parsed/trusted from the model's own `[1]`-style references in its text. The model can lie about what it used; the retrieval code can't.
+
+**Key concepts:**
+- *Distance/similarity scores* — `find_nearest` with `DistanceMeasure.COSINE` returns cosine distance (lower = more similar). Surfacing this in citations gives transparency into how confident the match was, useful for debugging bad retrieval before blaming generation.
+- *top_k tradeoffs* — more chunks = more context = costlier prompt + more chance of irrelevant text diluting the answer; too few chunks = real answer might be split across chunks not retrieved. `top_k=4` picked as a reasonable default for short filing excerpts; tune per corpus.
+- *Prompt-based grounding constraints* — the prompt explicitly enumerates the refusal string verbatim and forbids outside knowledge. This is necessary but not sufficient (models don't always obey), which is why programmatic citations exist as the trustworthy layer.
+- *Programmatic vs. model-reported citations* — citations are built directly from `retrieved_chunks` metadata (`source`, `chunk_index`, `distance`) regardless of whether the model's answer text contains `[1]`/`[2]` markers. This means citations always reflect what was actually retrieved and sent to the model, not what the model claims it used.
+- *This is not automated eval* — no scoring, no labeled question/answer pairs, no precision/recall on retrieval, no LLM-judge grading of answer quality. Manual spot-check only (one grounded query, one refusal query). Formal RAG evaluation (retrieval metrics, groundedness scoring, a verifier/LangGraph agent) is explicit **Phase 2 scope**.
+
+**Snippets:**
+```python
+# retrieve_relevant_chunks — src/copilot/retrieval.py
+query_vector = Vector(embed_text(question))
+vector_query = collection.find_nearest(
+    vector_field="embedding",
+    query_vector=query_vector,
+    distance_measure=DistanceMeasure.COSINE,
+    limit=top_k,
+    distance_result_field="distance",
+)
+```
+```python
+# grounding prompt template — src/copilot/rag_chain.py
+"Answer ONLY using the provided context. If the answer is not present in "
+"the context, respond exactly: 'I don't have enough information in the "
+"available documents to answer this.' Do not use outside knowledge. When "
+"you state a fact, reference which context number it came from, like [1]."
+```
+```python
+# citation attachment — independent of model output text
+citations = [
+    {"source": c["source"], "chunk_index": c["chunk_index"], "distance": c["distance"]}
+    for c in retrieved_chunks
+]
+```
+
+**ELI5:** Grounding is like an open-book exam where the student can only write answers using page numbers they actually cite — if it's not on the page, they have to say "not in the book" instead of making something up. The teacher (our code) doesn't trust the student's claimed page numbers either — it independently writes down which pages were handed to the student, so it always knows the true source regardless of what the student wrote.
+
+**Gotchas:**
+1. Model name needed live verification, not assumption. Distinction from the Component 2 embedding gotcha (`text-embedding-004` simply didn't appear in `ListModels` at all — a "this model doesn't exist for you" case): here, **both `gemini-2.5-flash` and `gemini-2.0-flash-001` DID appear in `ListModels` output with `generateContent` in their supported actions** — listing said they were usable — but the actual `generate_content` call failed for each, via two *independent* gates, not the same failure twice:
+   - `gemini-2.5-flash` → **404 NOT_FOUND, "no longer available to new users."** This is an **account-based access restriction** — sunset for new accounts/keys, unrelated to quota or tier. No amount of paid billing fixes this; the model is simply gone for this account. Full raw error body:
+     ```
+     google.genai.errors.ClientError: 404 NOT_FOUND. {'error': {'code': 404, 'message': 'This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use a newer model for the latest features and improvements.', 'status': 'NOT_FOUND'}}
+     ```
+   - `gemini-2.0-flash-001` → **429 RESOURCE_EXHAUSTED, `limit: 0` on `generate_content_free_tier_requests`.** This is a **per-model free-tier quota set to zero**, not ordinary rate-limiting — free tier gets none of this model at all, at any request rate. Paid tier would likely work fine (the quota is a free-tier allocation, not a hard model restriction). Full raw error body:
+     ```
+     google.genai.errors.ClientError: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0, model: gemini-2.0-flash\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0, model: gemini-2.0-flash\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 0, model: gemini-2.0-flash\nPlease retry in 9.399140862s.', 'status': 'RESOURCE_EXHAUSTED', 'details': [{'@type': 'type.googleapis.com/google.rpc.Help', 'links': [{'description': 'Learn more about Gemini API quotas', 'url': 'https://ai.google.dev/gemini-api/docs/rate-limits'}]}, {'@type': 'type.googleapis.com/google.rpc.QuotaFailure', 'violations': [{'quotaMetric': 'generativelanguage.googleapis.com/generate_content_free_tier_requests', 'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier', 'quotaDimensions': {'location': 'global', 'model': 'gemini-2.0-flash'}}, {'quotaMetric': 'generativelanguage.googleapis.com/generate_content_free_tier_requests', 'quotaId': 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', 'quotaDimensions': {'location': 'global', 'model': 'gemini-2.0-flash'}}, {'quotaMetric': 'generativelanguage.googleapis.com/generate_content_free_tier_input_token_count', 'quotaId': 'GenerateContentInputTokensPerModelPerMinute-FreeTier', 'quotaDimensions': {'location': 'global', 'model': 'gemini-2.0-flash'}}]}, {'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '9s'}]}}
+     ```
+   - `gemini-flash-latest` → **worked.** Nonzero free-tier quota, no account-level access restriction. This is the model actually in use (`src/copilot/rag_chain.py`).
+   Generalizable lesson: **`ListModels` only confirms a model exists in the API surface — it does NOT confirm your account/tier can call it.** Two independent gates sit between "listed" and "callable": (1) account-level access restrictions (model sunset for new users/keys — 404), and (2) per-model free-tier quota, which can be set to exactly zero for a given model regardless of overall API usage (429, `limit: 0`). Neither shows up in `ListModels`. Always verify with a live minimal `generate_content` call before committing to a model choice — don't infer callability from listing alone.
+2. `find_nearest` requires `distance_result_field` kwarg to get the similarity score back on each returned doc — without it, results only contain the stored fields, no distance.
+3. Refusal path still returns retrieved-chunk citations (the search still ran and found *something*, just nothing relevant) — this is intentional per the "attach whatever was retrieved" design, but worth noting the refusal response's citations show what was searched, not what was used to answer. To make this unambiguous to any caller, `generate_grounded_answer()` also returns `answer_grounded: bool` — `False` whenever the answer text equals the exact refusal string (whether because no chunks were retrieved at all, or because chunks were retrieved but the model judged them irrelevant and refused anyway). `True` means the model actually answered from context. Check this field, not just whether `citations` is non-empty, to tell "grounded with sources" apart from "searched but found nothing usable."
+
+---
+
 ## To Be Added
 
 - **IAM Deep-dive (service accounts, key management)**
@@ -812,6 +871,7 @@ vector = response.embeddings[0].values  # list[float], length 768
 - **LangGraph Verification Agents (Hallucination Mitigation)**
 - **CI/CD & Cloud Build**
 - **Cost Monitoring & Alerts**
+- **Log full raw API exception bodies to a file on failure, not just conversation/session context** — current gotcha docs risk truncation or loss if not caught during the same session.
 
 ---
 
