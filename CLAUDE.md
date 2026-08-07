@@ -42,6 +42,7 @@ A **supervisor agent** (LangGraph, Phase 2) routes requests to the right special
 - **Session shape:** bigger chunks covering a few related services at once, not single-service micro-sessions.
 - **Division of labor:** this chat = teaching, architecture decisions, planning, log-keeping. Implementation happens in **Claude Code**, in the project folder above.
 - **Claude Code model usage:** use **Haiku or Sonnet 5 (low reasoning effort)** for implementation sessions to conserve tokens and avoid hitting the 5-hour session limit early. Reserve higher-effort models only if a task genuinely needs it.
+- **Use subagents for noisy/verification work:** delegate detailed verification passes, log/output inspection, multi-file searches, and diagnostic checks to Claude Code subagents (isolated context, returns only a summary to the main session) rather than running verbose commands directly in the main session. Keep the main session focused on actual implementation, which is sequential and needs shared context. This conserves the main session's context/token budget, directly supporting the Haiku/Sonnet-low-effort token-conservation goal already in place.
 - **Production practices from day one, no throwaway scripts:**
   - Git repo, meaningful commits from the start.
   - Python env managed via `uv` (venv + dependency locking), not ad-hoc pip installs.
