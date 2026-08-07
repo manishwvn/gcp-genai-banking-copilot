@@ -984,7 +984,7 @@ FastAPI is like a **restaurant-in-a-box**. You don't build walls and install a k
 
 ### Common Gotchas
 
-**TBD** — to be filled in after Component 5 build if framework-specific quirks surface.
+Real build (Component 5): no surprises. `response_model=QueryResponse` with a nested `Citation` Pydantic model validated cleanly against the `rag_chain.py` return dict without extra glue code. `Exception` caught around `rag_query()` and mapped to a plain `{"error": ...}` JSON body — confirmed a raised `RuntimeError` never leaks a stack trace to the client (tested in `tests/test_api.py`). See Component 5 section below for the real Dockerfile/deploy notes.
 
 ---
 
@@ -1043,7 +1043,7 @@ A container is like an **IKEA-furniture-in-a-box shipment**. Instead of assuming
 
 ### Common Gotchas
 
-**TBD** — to be filled in after Component 5 Docker build if build-time or runtime surprises surface.
+Real build (Component 5): no dependency surprises inside the container — the two-stage `uv sync --no-install-project` then `uv sync` pattern (deps layer cached separately from app code layer) meant editing `src/` didn't force a full dependency reinstall on rebuild. `uv` binary copied in via `COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/` rather than installed via pip — faster, no extra pip bootstrap layer. Biggest real gotcha wasn't Docker at all — it was Cloud Build IAM (see Cloud Run section below).
 
 ---
 
@@ -1090,7 +1090,9 @@ Cloud Run is like **renting a food truck**. You don't own the truck or parking l
 
 ### Common Gotchas
 
-**TBD** — to be filled in after Component 5 deployment surfaces real gotchas (cold start impact, quotas, logging setup, etc.).
+**Real gotcha — Cloud Build default service account missing IAM permissions on first deploy.** `gcloud run deploy --source=.` failed with `PERMISSION_DENIED... could not resolve source` fetching the uploaded source zip from the auto-created `run-sources-*` GCS bucket, attributed to the project's default compute service account (`PROJECT_NUMBER-compute@developer.gserviceaccount.com`). Root cause: `artifactregistry.googleapis.com`, `cloudbuild.googleapis.com`, and `run.googleapis.com` weren't enabled yet on this project (auto-prompted and enabled by the `deploy` command itself), and IAM role propagation for the newly-enabled Cloud Build service lagged behind. Fix: explicitly granted `roles/cloudbuild.builds.builder` to the compute default service account, then retried after a short wait — second retry succeeded. **Lesson:** on a freshly-provisioned project's first `--source=.` deploy, expect a possible IAM-propagation-related failure unrelated to app code; a retry after granting `cloudbuild.builds.builder` (or simply waiting a minute or two for propagation) resolves it. Not specific to this app — a one-time per-project setup gotcha.
+
+Deploy succeeded on the retry with zero further issues. Full request-verification results (health/query/refusal, cold start, logs) are in the Component 5 real-build section below.
 
 ---
 
@@ -1243,6 +1245,74 @@ gcloud run deploy banking-copilot \
 1. **`google.auth.default()` order matters for local dev.** It checks (in order): Google Cloud SDK credentials, then `GOOGLE_APPLICATION_CREDENTIALS` env var, then application default credentials. If multiple are set, first match wins. For local testing, explicitly set `GOOGLE_APPLICATION_CREDENTIALS=path/to/filings-rag-app-key.json` to avoid surprise auth failures.
 2. **Cloud Run doesn't use key files.** Attempting to reference a key file path inside a container fails (the file isn't there). Always use `google.auth.default()` for Cloud Run code; it checks the environment automatically.
 3. **Secret Manager access also uses attached identity.** When Cloud Run injects a secret as an env var, it's fetching the secret on behalf of the attached service account. That account must have `roles/secretmanager.secretAccessor` on that specific secret — no fallback if it doesn't.
+
+---
+
+## Component 5: FastAPI + Docker + Cloud Run — Real Build Notes
+
+### What Was Built
+
+`src/copilot/api.py` (FastAPI app, `/health` + `/query`), `app.py` (uvicorn entry point, loads `.env` for local runs), `Dockerfile`, `.dockerignore`. Deployed via `gcloud run deploy --source=.` (Cloud Build builds the image from the Dockerfile, no local Docker daemon needed).
+
+### Real Working Dockerfile
+
+```dockerfile
+FROM python:3.11-slim
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY src/ src/
+COPY app.py ./
+
+RUN uv sync --frozen --no-dev
+
+EXPOSE 8080
+
+CMD ["sh", "-c", "uv run uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]
+```
+
+Two-stage `uv sync` (deps-only layer before app code is copied in) keeps the dependency-install layer cacheable across code-only rebuilds. `${PORT:-8080}` reads Cloud Run's injected `PORT` env var, falls back to 8080 for local `docker run`. `USER appuser` runs the container as non-root (added after an initial root-only build, per security review). CMD invokes `.venv/bin/uvicorn` directly rather than `uv run uvicorn` — see gotcha below.
+
+**Gotcha: `uv run <command>` at container CMD time re-resolves/downloads dependencies on every container start (not just build time)** — this is fine as root (fast, cached) but broke health checks when switching to a non-root user (permission friction accessing uv's cache, plus wasted startup time re-downloading packages like pygments). Fix: invoke the prebuilt virtual environment binary directly in CMD (`.venv/bin/uvicorn app:app ...`) instead of `uv run uvicorn ...` — this uses the environment already built during the Docker image build step, no re-resolution at runtime. General lesson: `uv run` is convenient for local dev where re-resolution is cheap/cached, but inside a container CMD, prefer calling the venv's binaries directly for faster, more reliable startup.
+
+### Real Working Deploy Command
+
+```bash
+gcloud run deploy filings-rag-api \
+  --source=. \
+  --region=us-central1 \
+  --service-account=filings-rag-app@gcp-genai-banking.iam.gserviceaccount.com \
+  --set-secrets=GEMINI_API_KEY=gemini-api-key:latest \
+  --allow-unauthenticated \
+  --project=gcp-genai-banking
+```
+
+Deployed service: `https://filings-rag-api-27353588174.us-central1.run.app`
+
+### What Actually Happened (vs. the pre-build conceptual session)
+
+- **FastAPI:** no framework-specific surprises. `response_model` validation against the existing `rag_chain.py` dict shape worked with zero glue code.
+- **Docker:** no dependency issues inside the container that hadn't shown up locally — the app has no OS-level dependencies beyond what `python:3.11-slim` + `uv sync` provide (no compiled-extension surprises from `pdfplumber` etc.).
+- **Cloud Run / IAM (the one real gotcha):** first `--source=.` deploy failed with `PERMISSION_DENIED` fetching the uploaded source from the auto-created `run-sources-*` bucket — the project's default compute service account was missing `roles/cloudbuild.builds.builder`, compounded by IAM propagation lag right after `artifactregistry`/`cloudbuild`/`run` APIs were freshly auto-enabled. Granted the role, retried once, succeeded. One-time per-project setup issue, not app-related — see the Cloud Run section's gotchas above for full detail.
+- **Cold start:** not separately load-tested this session (out of scope, per CLAUDE.md's explicit load-testing exclusion) — first real request (`/health` via curl) succeeded on the first try with no visible delay-related error; Cloud Run logs showed clean `Application startup complete` before it.
+- **Logs:** checked via `gcloud run services logs read` — zero errors or warnings in the startup + first-request window.
+- **Billing safeguard:** a $0/$1 zero-spend budget alert was configured this session on billing account `0147EC-94B896-30A818` ($1 threshold, email notification to default billing contacts) as the project's cost tripwire backstop — discussed early in the project but never actually set up until now.
+
+### Live Verification (real deployed URL, not local)
+
+- `GET /health` → `{"status":"ok"}`
+- `POST /query` (in-scope, "What are ACME's main financial risks mentioned in the filing?") → real grounded answer, `answer_grounded: true`, 2 citations from `sample-10k`.
+- `POST /query` (out-of-scope, "What is the population of Tokyo?") → refusal text, `answer_grounded: false`. Citations array is non-empty (nearest chunks still listed with high distance ~0.55) — expected per the Component 4 design: citations are attached programmatically regardless of relevance, `answer_grounded` is what disambiguates "used" vs. "searched but irrelevant."
+- Full test suite: **18/18 passed** (3 new in `tests/test_api.py`, mocked `rag_query()`, no real API/Firestore calls).
+
+### Security Note
+
+Deployed with `--allow-unauthenticated` — the service URL is publicly callable by anyone with the link, no auth required. Acceptable for this demo (synthetic 10-K data only, no real sensitive information), but a deliberate tradeoff, not an oversight. Flagging here so it isn't a surprise later if this pattern gets reused for anything with real data.
 
 ---
 

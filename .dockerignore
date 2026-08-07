@@ -1,0 +1,12 @@
+.venv
+.git
+.env
+*-key.json
+__pycache__
+**/__pycache__
+tests/
+data/*.pdf
+README.md
+learnings.md
+CLAUDE.md
+scripts/
