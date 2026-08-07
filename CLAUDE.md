@@ -26,6 +26,7 @@ A **supervisor agent** (LangGraph, Phase 2) routes requests to the right special
 
 - **LLM + embeddings:** Google AI Studio Gemini API free tier (separate free pool from GCP billing) — not Vertex AI managed model endpoints, which are billed.
 - **Vector store:** Firestore native KNN vector search — doubles as app DB, billed under normal Firestore read/write Always-Free quotas. No separate paid vector DB.
+- **Web framework:** FastAPI. Switched from initial Flask default before Component 5 build — automatic OpenAPI/Swagger docs (better interview demo artifact), Pydantic request/response validation, async support useful for Phase 2's multi-skill supervisor routing. Decided explicitly, not defaulted.
 - **Hosting:** Cloud Run (Always Free: 2M requests/month).
 - **Regions:** Compute/Storage Always-Free usage restricted to `us-west1`, `us-central1`, `us-east1`.
 - **Datasets:** SEC EDGAR filings + public earnings call transcript corpus (Phase 1); PaySim/Kaggle fraud datasets + synthetic KYC/statements (Phase 2).
@@ -142,9 +143,9 @@ A **supervisor agent** (LangGraph, Phase 2) routes requests to the right special
 - **Committed:** [component-done].
 
 **f) Deferred to Phase 2:**
-- Grounding evaluator agent (Anthropic free evals framework) — measure groundedness/hallucination rate systematically.
+- Formal grounding/hallucination evaluation metrics (e.g. precision@k, recall@k, faithfulness scoring) — specific approach/tooling not yet decided, research when Phase 2 eval work begins.
 - LangGraph supervisor routing (stub only in Phase 1).
 - Real fraud-explainer and KYC-extraction skills.
 
 - **Status:** Component 4 COMPLETE and verified.
-- **Phase 1 MVP readiness:** Core retrieval + grounded RAG chain done. Next: deploy to Cloud Run, add HTTP API layer (FastAPI), integrate synthetic dataset (SEC filings corpus), shadow test with production-like load before Phase 2 agent layer.
+- **Phase 1 MVP readiness:** Core retrieval + grounded RAG chain done. Next: deploy to Cloud Run, add HTTP API layer (FastAPI), integrate synthetic dataset (SEC filings corpus).
