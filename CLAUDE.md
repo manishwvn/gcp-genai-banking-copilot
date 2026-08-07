@@ -67,3 +67,84 @@ A **supervisor agent** (LangGraph, Phase 2) routes requests to the right special
 - **Gotcha hit:** `roles/firestore.user` and `roles/firestore.editor` not valid at project level — used `roles/datastore.user` instead (Firestore runs on Datastore API under the hood, IAM roles inherited from there). Logged in `learnings.md`.
 - **Executed:** Initialized git repo. Created `.gitignore` (protects service account key files, `.env`). Created `.env` with placeholder credentials. First git commit made.
 - Next step: Set up `uv` venv + core Python project structure. Start new Claude Code session for Phase 1 implementation.
+
+### 2026-08-05 — Python project setup, auth skeleton, verification
+- **Executed:** IAM setup completed — service account `filings-rag-app` created, roles assigned (`datastore.user`, `storage.objectViewer`), private key created.
+- **Executed:** Git initialized, `.gitignore` + `.env` created.
+- **Executed:** Python project structure via `uv` — venv, `pyproject.toml`, `src/copilot/`, `tests/`.
+- **Executed:** Auth skeleton implemented — `auth.py` (loads credentials), `firestore_client.py` (`get_db()` helper), `embeddings.py` (stub).
+- **Validated:** All 8 setup checks passed — file structure, deps, imports, code, git, README, `.gitignore`.
+- **Executed:** Ran `main.py` — Firestore client initialized successfully, auth end-to-end verified.
+- **Flag:** `google-generativeai` package deprecated upstream — swap to `google-genai` before Phase 2 heavy use. Noted in `learnings.md`.
+- Next step: Start new Claude Code session for Phase 1 implementation (document ingestion → chunking → embedding → Firestore vector storage → retrieval → Cloud Run deployment).
+
+### 2026-08-05 — Component 1: Document Ingestion & Chunking (complete)
+- **Built:** Document ingestion component with synthetic test fixtures (sample 10-K PDF, earnings call transcript); `document_ingestion.py` implemented with `read_pdf_text()` (PDF → text via pdfplumber), `chunk_text()` (sentence-boundary chunking with overlap), `create_firestore_chunks()` (write to Firestore).
+- **Infrastructure gap resolved:** Firestore API not auto-enabled on new project, and no native-mode database instance created. Both are one-time provisioning steps required before any client writes succeed. Enabled API (`gcloud services enable firestore.googleapis.com`), created native-mode database (us-central1, freeTier: true). Gotcha #5 added to `learnings.md`.
+- **End-to-end verified:** Sample 10-K chunked and written to Firestore collection `filings_chunks` (documents visible in GCP Console, live read confirmed).
+- **Detailed verification pass caught 3 gaps, all fixed:** (1) No test coverage for `chunk_text()` — added `tests/test_document_ingestion.py` with sentence-boundary, overlap, single-chunk edge cases (4/4 tests passing). (2) Unused `nltk` dependency (chunking uses regex) — removed `nltk` + transitive deps (`joblib`, `regex`), relocked with `uv sync`. (3) Firestore provisioning gotcha undocumented — logged in `learnings.md` gotcha #5.
+- **Data integrity:** Sequential chunk indices, no duplicates, no chunks near 1MB Firestore document limit, no empty/garbage text.
+- **Committed:** Build + verification fixes.
+- **Status:** Component 1 COMPLETE and verified.
+- Next step: Start new Claude Code session for Component 2 — Embedding generation (Gemini API embeddings → Firestore vector fields).
+
+### 2026-08-05 — Post-commit hook for component-done workflow
+- **Executed:** Set up `.githooks/post-commit` hook. Prints banner when commit message contains `[component-done]` marker, reminding to run the doc-update prompt in doc-updates session. Configured via `git config core.hooksPath .githooks`. Tested working (fires on marker, silent otherwise).
+- **Committed:** 048d717.
+- **Going forward:** Mark the final commit of each verified component/phase with `[component-done]` to auto-trigger doc reminder.
+
+### 2026-08-05 — Gemini API free-tier key detour & Component 2: Embedding Generation (complete)
+
+**a) Gemini API free-tier key detour:**
+- Discovered creating a Gemini API key under gcp-genai-banking (billing-linked project) automatically promotes the key to paid Tier 1/Postpay — confirmed via Google's billing docs: tier is determined by project's billing account status, not usage or key settings.
+- "Buy credits" purchase dialog appeared when viewing that key's billing setup — caught before any charge occurred.
+- Fix: created second GCP project `gcp-genai-llm-free` with NO billing account linked, created Gemini API key there instead — confirmed "Free tier" badge in AI Studio. Kept gcp-genai-banking as default project, updated .env with real free-tier key.
+- **Architectural note:** GCP Always-Free and AI Studio Gemini free tier are separate quotas requiring separate projects (billing-linked vs. billing-absent).
+
+**b) Component 2 (Embedding Generation) — built and verified:**
+- Migrated `google-generativeai` (deprecated) to `google-genai` (new client is object-oriented: `genai.Client(api_key=...)` + method calls vs. old module-level config+free-functions).
+- Discovered via live `ListModels` that `text-embedding-004/005` no longer served; used `gemini-embedding-001` with `output_dimensionality=768`.
+- Implemented `embed_text()` (retry + exponential backoff) and `embed_filings.py` (idempotent, skips pre-embedded chunks).
+- Created Firestore composite vector index on `filings_chunks.embedding` (768-dim), confirmed state READY via gcloud.
+- Verification pass (not logs-only): live Firestore confirmed 768-dim vectors on chunks, idempotency rerun (0 embedded/2 skipped), index status check, pytest (8/8 passing).
+- Found gotcha: `firestore.Vector` not at package root in installed `google-cloud-firestore`; must import from `google.cloud.firestore_v1.vector`.
+- API quota used: 2 embedding calls (nowhere near free-tier limits).
+- **Committed:** [component-done].
+- **Status:** Component 2 COMPLETE and verified.
+- **Next step:** Component 3 (vector index) already done this session — next: Component 4 (Retrieval & RAG chain: query embedding → Firestore `find_nearest` → prompt format → Gemini generation with citations).
+
+### 2026-08-05 — Phase 1 Component 4: Retrieval & Grounded RAG Chain (complete)
+
+**a) Retrieval & RAG Chain — built:**
+- Implemented `src/copilot/retrieval.py`: `retrieve_relevant_chunks()` (query text → embed via Gemini API → Firestore `find_nearest(embedding, 768-dim vectors, distance_type=COSINE, limit=top_k)` → sorted results by relevance).
+- Implemented `src/copilot/rag_chain.py`: `generate_grounded_answer()` (takes query + retrieved chunks, strict grounding prompt, generates answer with citations programmatically attached from chunk metadata, explicit refusal instruction for out-of-scope questions).
+- Implemented `rag_query()` end-to-end chain orchestrator (query → retrieve → generate).
+- Implemented `src/copilot/query_filings.py` CLI entry point for interactive queries.
+- **Design decision — strict grounding:** Citations are attached from retrieved chunk metadata and document source in code, not trusted from model's generated text. Model cannot fabricate sources. Out-of-scope queries explicitly instructed to refuse rather than hallucinate.
+
+**b) Answer grounding field:**
+- Added boolean `answer_grounded` to distinguish two scenarios: (1) answered from context (`answer_grounded=True`, citations present), vs. (2) searched but found no usable context (`answer_grounded=False`, no citations but refusal still grounded). Both have citation lists non-empty or empty by design intent — the boolean disambiguates the user-facing meaning.
+
+**c) Model selection verification — live testing required:**
+- `gemini-2.5-flash`: failed live with 404 response — account-level access restriction, model sunset for new accounts (unrelated to billing tier).
+- `gemini-2.0-flash-001`: failed live with 429 response — free-tier quota explicitly zero for this model (distinct from Component 2's "model not listed" gotcha — this is "model exists but isn't accessible for this account/tier").
+- `gemini-flash-latest`: succeeded — nonzero free-tier quota, no access restriction. Used going forward. Both failure modes documented in `learnings.md` with raw error bodies, explicitly separated from embedding-model gotchas.
+
+**d) End-to-end verification:**
+- Grounded query ("What are ACME's main financial risks as disclosed in their 10-K?") returned accurate answer with citations matching live filing content.
+- Refusal query ("What is the population of Tokyo?") correctly refused out-of-scope (answer_grounded=False, no citations).
+- Both paths validated live against real Firestore data and Gemini API.
+
+**e) Testing & test-isolation fix:**
+- Test suite: 15/15 passing, mocked (no real API/quota used).
+- Coverage: retrieval ranking, grounding prompt formatting, citation attachment, refusal path, edge cases (empty results, malformed chunks).
+- Fixed test-isolation bug: mocked Gemini client leaked between tests due to missing reset fixture — added per-test client mock setup.
+- **Committed:** [component-done].
+
+**f) Deferred to Phase 2:**
+- Grounding evaluator agent (Anthropic free evals framework) — measure groundedness/hallucination rate systematically.
+- LangGraph supervisor routing (stub only in Phase 1).
+- Real fraud-explainer and KYC-extraction skills.
+
+- **Status:** Component 4 COMPLETE and verified.
+- **Phase 1 MVP readiness:** Core retrieval + grounded RAG chain done. Next: deploy to Cloud Run, add HTTP API layer (FastAPI), integrate synthetic dataset (SEC filings corpus), shadow test with production-like load before Phase 2 agent layer.
