@@ -175,3 +175,55 @@ A **supervisor agent** (LangGraph, Phase 2) routes requests to the right special
 **d) Next step:** Component 5 build (FastAPI HTTP API, Dockerfile, Cloud Run deployment) not yet started, pending this doc update.
 
 - **Status:** Pre-build conceptual work complete. Infrastructure ready for Component 5.
+
+### 2026-08-07 — Phase 1 Component 5: FastAPI Service, Docker, Cloud Run Deployment (complete)
+
+**a) Component 5 built — FastAPI HTTP API layer:**
+- Implemented `src/copilot/api.py`: POST `/query` (Pydantic request/response validation, structured error handling), GET `/health`, JSON error responses with status codes.
+- Implemented `app.py` (uvicorn entry point).
+- Created Dockerfile (multi-stage or single-stage, Alpine base for size, WORKDIR setup, dependency layer caching).
+- Created `.dockerignore` (excludes git, tests, caches, local keys — smaller image, faster build).
+- **Design decision — strict grounding at HTTP boundary:** API response includes `answer_grounded` boolean; client code can distinguish answered-from-context vs. refused-out-of-scope without parsing model text.
+
+**b) Infrastructure & deployment model:**
+- **Service account reuse:** `filings-rag-app` already has all needed roles (Firestore, Storage, Secret Manager). No new identity created. Cloud Run attaches this SA as the pod identity; code uses `google.auth.default()` which detects Cloud Run environment and auto-authenticates — no key file in container.
+- **Secret injection:** `GEMINI_API_KEY` stored in Secret Manager; deployed with `--set-env-vars=GEMINI_API_KEY=sm://gemini-api-key` (Cloud Run auto-loads). Verified secret permission check on startup.
+- **Public deployment:** `--allow-unauthenticated` used for demo accessibility. Explicit decision — synthetic data only, safe for portfolio demo. Noted in commit message.
+
+**c) Cost & abuse safeguards:**
+- Cloud Run `--max-instances=3` cap to prevent runaway scaling from quota abuse or DoS.
+- **$0/$1 budget alert finally configured** on billing account (0147EC-94B896-30A818) after being deferred since project setup — this closes a gap identified in kickoff but never implemented until now. Discovered pre-existing $5 budget alert already on account (thresholds 0.5/0.9/1.0/1.5).
+- All quotas verified as Always-Free: Firestore, Cloud Storage, Cloud Run, Secret Manager, Gemini Embeddings API, Gemini generation API.
+
+**d) Gotchas hit & fixed:**
+1. **Cloud Build IAM propagation lag:** First deploy failed with `cloudbuild.builds.builder` missing on Compute Engine default service account. Granted role via `gcloud iam service-accounts add-iam-policy-binding`; confirmed this rides on pre-existing `roles/editor` grant (broad, not introduced by this session). Gotcha documented in learnings.md.
+2. **Non-root Docker user broke startup:** Attempted to run service as non-root user; `uv run` re-resolves dependencies at every container start and hit permission friction. Fixed by invoking prebuilt venv binary directly in CMD instead of `uv run` — dependency resolution happens at build time only.
+3. **Venv binary path resolution:** Confirmed `python` binary path in built venv and used full path in Dockerfile CMD (`/venv/bin/python -m uvicorn...`).
+
+**e) Verification — live end-to-end against deployed URL:**
+- GET `/health` → 200 OK.
+- POST `/query` with grounded question → 200, `answer_grounded=true`, real citations from live Firestore.
+- POST `/query` with out-of-scope question → 200, `answer_grounded=false`, refusal (no hallucination).
+- OpenAPI docs at `/docs` working and accurate.
+- All requests logged; response times <2s (cold start + embedding + retrieval + generation).
+- Deployed service URL: `https://filings-rag-api-27353588174.us-central1.run.app`
+
+**f) Testing & verification approach:**
+- Test suite: 18/18 passing (2 benign third-party deprecation warnings, not actionable).
+- Adopted subagent delegation for verification passes (curl output, logs, status checks) — kept verbose output out of main session context per new CLAUDE.md convention.
+- Coverage: Pydantic validation (invalid payloads rejected), health check, RAG pipeline integration, error cases, deployment readiness.
+
+**g) Commits:**
+- c69c756 — `[component-done]` — built and verified Component 5.
+
+**h) Phase 1 complete:**
+All five components built, tested, verified, and deployed:
+1. Document Ingestion & Chunking (Component 1) — PDF → Firestore chunks
+2. Embedding Generation & Vector Indexing (Components 2 & 3) — Gemini embeddings → Firestore vectors
+3. Retrieval & Grounded RAG Chain (Component 4) — query → retrieval → generation with citations
+4. FastAPI HTTP API Layer (Component 5) — `POST /query`, `GET /health`, deployed on Cloud Run
+5. Zero spend maintained throughout — all services on Always-Free tier, now backed by budget alerts.
+
+**Status:** Phase 1 MVP COMPLETE and deployed.
+
+**Next phase:** Phase 2 — agentic layer. Add KYC/statement extraction skill and fraud-explainer skill. Introduce LangGraph supervisor agent to route between three specialist capabilities. Add groundedness/verifier agent. Introduce formal evaluation metrics. Recommend fresh planning conversation given multi-agent architecture scope shift from Phase 1's single-pipeline MVP.
