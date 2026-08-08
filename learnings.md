@@ -4,6 +4,41 @@ This document captures what was learned about each GCP service and concept used 
 
 ---
 
+## Phase 1 Component Build Log — Bridge to Concept Sections
+
+Quick reference: what each component built and which concept sections explain the underlying tech. Full session-log entries and deployment details in CLAUDE.md.
+
+### Component 1: Document Ingestion & Chunking
+- **Built:** `src/copilot/document_ingestion.py` — PDF text extraction (pdfplumber), sentence-boundary chunking with overlap, Firestore writes to `filings_chunks` collection.
+- **Key concepts:** "Document Ingestion & Chunking Strategy" (this file).
+- **Status:** Complete, live Firestore data verified.
+
+### Component 2: Embedding Generation & Vector Indexing
+- **Built:** `src/copilot/embeddings.py` (retry logic), `embed_filings.py` (idempotent embedding script), `google-genai` SDK migration (from deprecated `google-generativeai`).
+- **Tech:** Gemini API embeddings, `gemini-embedding-001` (768-dim), migrated to `google-genai` client.
+- **Key concepts:** "Embedding Generation & Vector Indexing" (this file, includes model-availability gotchas); "Deprecation & Migration Notes".
+- **Status:** Complete, 768-dim vectors in Firestore, Firestore composite vector index created.
+
+### Component 3: Vector Index Setup
+- **Built:** Firestore composite index on `filings_chunks.embedding` (768-dim, COSINE distance).
+- **Key concepts:** "Embedding Generation & Vector Indexing" section (index creation commands).
+- **Status:** Complete, index state READY.
+
+### Component 4: Retrieval & Grounded RAG Chain
+- **Built:** `src/copilot/retrieval.py` (Firestore `find_nearest` + embedding), `src/copilot/rag_chain.py` (grounded generation with programmatic citations), `src/copilot/query_filings.py` (CLI query tool).
+- **Tech:** Firestore vector search, Gemini API generation (`gemini-flash-latest`, NOT `gemini-2.5-flash`), strict grounding prompt + programmatic citations, `answer_grounded` boolean for ambiguity resolution.
+- **Key concepts:** "Retrieval & Grounded Generation (RAG Chain)" section (design rationale, model-access gotchas with full error bodies); "Web APIs & HTTP Fundamentals" (foundation for Component 5).
+- **Status:** Complete, live end-to-end verified against real Firestore data.
+
+### Component 5: FastAPI HTTP API + Docker + Cloud Run Deployment
+- **Built:** `src/copilot/api.py` (FastAPI app with POST `/query`, GET `/health`, Pydantic validation), `app.py` (uvicorn entry point), Dockerfile (multi-stage, `uv` for dependency management), `.dockerignore`, Cloud Run deployment via `gcloud run deploy --source=.`.
+- **Tech:** FastAPI framework (auto OpenAPI docs at `/docs`), Docker containerization (Alpine base, two-stage builds for layer caching), Cloud Run serverless hosting (Always-Free tier), service account attached identity (no key files in container), Secret Manager credential injection for `GEMINI_API_KEY`.
+- **Key concepts:** "FastAPI Framework", "Containers & Docker", "Cloud Run", "Secret Manager", "Cloud Run Service Account Identity", "Component 5: FastAPI + Docker + Cloud Run — Real Build Notes" (full deployment details and live verification results).
+- **Live URL:** `https://filings-rag-api-27353588174.us-central1.run.app` (public, `--allow-unauthenticated`).
+- **Status:** Complete, deployed, live end-to-end verified (health check, grounded query, refusal query, OpenAPI docs all working).
+
+---
+
 ## GCP Fundamentals — Projects, Billing, and `gcloud` CLI
 
 ### What It Is
@@ -298,11 +333,16 @@ db = firestore.Client(project="gcp-genai-banking")
 ```
 
 **Add a document with an embedding:**
+
+Note: as of google-cloud-firestore 2.27.0, Vector is not exported at the top-level `firestore` namespace — import from firestore_v1.vector directly (see Embedding Generation section for full gotcha).
+
 ```python
+from google.cloud.firestore_v1.vector import Vector
+
 db.collection("filings").document("10k-2024").set({
     "title": "ACME Corp 10-K 2024",
     "source": "SEC EDGAR",
-    "embedding": firestore.Vector([0.12, 0.34, -0.56, ...]),  # 768-dim vector
+    "embedding": Vector([0.12, 0.34, -0.56, ...]),  # 768-dim vector
     "uploaded_at": firestore.SERVER_TIMESTAMP
 })
 ```
@@ -351,10 +391,9 @@ Firestore is like **a smart filing cabinet that understands meaning.**
 **API key:** A string you pass to authenticate requests. Created in AI Studio, not tied to GCP IAM. Different from GCP service account keys.
 
 **Rate limits (free tier, as of Aug 2026):**
-- **Gemini 2.5 Flash:** ~15 requests per minute, ~1,500 requests per day.
-- **Gemini 3.1 Flash-Lite:** Similar, slightly higher RPM.
-- **Embedding models (text-embedding-005):** Free tier, but check docs for current limits (usually generous).
-- **Image generation (Gemini 2.5 Flash Image):** 500 requests/day.
+- **Gemini Flash Latest (`gemini-flash-latest`):** ~15 requests per minute, ~1,500 requests per day. Live-verified in Component 4 as working on free tier.
+- **Gemini 2.5 Flash/2.0 Flash-001:** NOT available on free tier this account (tested in Component 4; `gemini-2.5-flash` → 404 "no longer available to new users"; `gemini-2.0-flash-001` → 429 with `limit: 0` on free-tier quota). See Retrieval & Grounded Generation gotchas for full error bodies.
+- **Embedding models (gemini-embedding-001):** Free tier, 768-dim output. text-embedding-004/005 no longer served (see Embedding Generation gotchas).
 - These limits reset at midnight Pacific Time (PST).
 
 **Request vs. token limits:**
@@ -383,12 +422,16 @@ print(response.text)
 ```
 
 **Generate embeddings:**
+
+text-embedding-004/005 are no longer served as of this project's Aug 2026 build — verified via ListModels, see Embedding Generation section.
+
 ```python
 response = genai.embed_content(
-    model="models/text-embedding-005",
-    content="SEC filing summary text here..."
+    model="gemini-embedding-001",
+    content="SEC filing summary text here...",
+    config={"output_dimensionality": 768}
 )
-embedding = response['embedding']  # List of 768 floats
+embedding = response.embeddings[0].values  # List of 768 floats
 ```
 
 ### ELI5 Explanation
@@ -1271,12 +1314,15 @@ COPY app.py ./
 
 RUN uv sync --frozen --no-dev
 
+RUN useradd -m appuser
+USER appuser
+
 EXPOSE 8080
 
-CMD ["sh", "-c", "uv run uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["sh", "-c", ".venv/bin/uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]
 ```
 
-Two-stage `uv sync` (deps-only layer before app code is copied in) keeps the dependency-install layer cacheable across code-only rebuilds. `${PORT:-8080}` reads Cloud Run's injected `PORT` env var, falls back to 8080 for local `docker run`. `USER appuser` runs the container as non-root (added after an initial root-only build, per security review). CMD invokes `.venv/bin/uvicorn` directly rather than `uv run uvicorn` — see gotcha below.
+Two-layer `uv sync` (deps-only first, then full) keeps the dependency-install layer cacheable across code-only rebuilds. `${PORT:-8080}` reads Cloud Run's injected `PORT` env var, falls back to 8080 for local `docker run`. `RUN useradd -m appuser` + `USER appuser` runs the container as non-root for security. CMD invokes `.venv/bin/uvicorn` directly (prebuilt at image build time) rather than `uv run uvicorn` — see gotcha below for why.
 
 **Gotcha: `uv run <command>` at container CMD time re-resolves/downloads dependencies on every container start (not just build time)** — this is fine as root (fast, cached) but broke health checks when switching to a non-root user (permission friction accessing uv's cache, plus wasted startup time re-downloading packages like pygments). Fix: invoke the prebuilt virtual environment binary directly in CMD (`.venv/bin/uvicorn app:app ...`) instead of `uv run uvicorn ...` — this uses the environment already built during the Docker image build step, no re-resolution at runtime. General lesson: `uv run` is convenient for local dev where re-resolution is cheap/cached, but inside a container CMD, prefer calling the venv's binaries directly for faster, more reliable startup.
 
@@ -1316,17 +1362,16 @@ Deployed with `--allow-unauthenticated` — the service URL is publicly callable
 
 ---
 
-## To Be Added
+## To Be Added (Phase 2+)
 
-- **Firestore Indexing & Query Planning**
-- **LangChain & LangGraph Patterns**
+- **Firestore Indexing & Query Planning** — beyond basic composite vector index.
 - **Gemini Function Calling**
-- **RAG Evaluation & Grounding Checks**
+- **RAG Evaluation & Grounding Checks** — formal metrics, labeled datasets, verifier agents.
 - **LangGraph Verification Agents (Hallucination Mitigation)**
-- **CI/CD & Cloud Build**
-- **Cost Monitoring & Alerts**
+- **CI/CD & Cloud Build** — beyond manual `gcloud run deploy`.
+- **Cost Monitoring & Alerts** — beyond the initial $0/$1 budget alert (real-time dashboards, per-service breakdowns).
 
 ---
 
-**Last updated:** 2026-08-07 (Pre-Component 5 conceptual session: APIs, FastAPI, Docker, Cloud Run, Secret Manager, service account identity model)
+**Last updated:** 2026-08-08 — through Phase 1 completion (Components 1-5 complete; FastAPI, Docker, Cloud Run deployed; budget alerts configured).
 **Scope:** GCP_GEN_AI Banking Copilot, Phase 1 (Filings RAG MVP)

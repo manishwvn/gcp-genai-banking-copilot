@@ -181,13 +181,13 @@ A **supervisor agent** (LangGraph, Phase 2) routes requests to the right special
 **a) Component 5 built — FastAPI HTTP API layer:**
 - Implemented `src/copilot/api.py`: POST `/query` (Pydantic request/response validation, structured error handling), GET `/health`, JSON error responses with status codes.
 - Implemented `app.py` (uvicorn entry point).
-- Created Dockerfile (multi-stage or single-stage, Alpine base for size, WORKDIR setup, dependency layer caching).
+- Created Dockerfile (`python:3.11-slim` base, `COPY --from` uv binary, two-layer `uv sync` for dependency caching, non-root `appuser`, direct `.venv/bin/uvicorn` in CMD).
 - Created `.dockerignore` (excludes git, tests, caches, local keys — smaller image, faster build).
 - **Design decision — strict grounding at HTTP boundary:** API response includes `answer_grounded` boolean; client code can distinguish answered-from-context vs. refused-out-of-scope without parsing model text.
 
 **b) Infrastructure & deployment model:**
 - **Service account reuse:** `filings-rag-app` already has all needed roles (Firestore, Storage, Secret Manager). No new identity created. Cloud Run attaches this SA as the pod identity; code uses `google.auth.default()` which detects Cloud Run environment and auto-authenticates — no key file in container.
-- **Secret injection:** `GEMINI_API_KEY` stored in Secret Manager; deployed with `--set-env-vars=GEMINI_API_KEY=sm://gemini-api-key` (Cloud Run auto-loads). Verified secret permission check on startup.
+- **Secret injection:** `GEMINI_API_KEY` stored in Secret Manager; deployed with `--set-secrets=GEMINI_API_KEY=gemini-api-key:latest` (Cloud Run auto-loads at container startup). Verified secret permission check on startup.
 - **Public deployment:** `--allow-unauthenticated` used for demo accessibility. Explicit decision — synthetic data only, safe for portfolio demo. Noted in commit message.
 
 **c) Cost & abuse safeguards:**
@@ -197,8 +197,7 @@ A **supervisor agent** (LangGraph, Phase 2) routes requests to the right special
 
 **d) Gotchas hit & fixed:**
 1. **Cloud Build IAM propagation lag:** First deploy failed with `cloudbuild.builds.builder` missing on Compute Engine default service account. Granted role via `gcloud iam service-accounts add-iam-policy-binding`; confirmed this rides on pre-existing `roles/editor` grant (broad, not introduced by this session). Gotcha documented in learnings.md.
-2. **Non-root Docker user broke startup:** Attempted to run service as non-root user; `uv run` re-resolves dependencies at every container start and hit permission friction. Fixed by invoking prebuilt venv binary directly in CMD instead of `uv run` — dependency resolution happens at build time only.
-3. **Venv binary path resolution:** Confirmed `python` binary path in built venv and used full path in Dockerfile CMD (`/venv/bin/python -m uvicorn...`).
+2. **Non-root Docker user + `uv run` at container CMD time:** Initial attempt ran service as non-root user with `CMD ["sh", "-c", "uv run uvicorn ..."]`. This broke at startup: `uv run` re-resolves/downloads dependencies on every container start (not build time), hitting permission friction when appuser couldn't write to uv's cache, plus wasting startup time. Fixed by invoking prebuilt venv binary directly in CMD: `CMD ["sh", "-c", ".venv/bin/uvicorn app:app ..."]` — dependency resolution happens once at image build time, no re-resolution at runtime. General lesson: `uv run` is fine for local dev, but in container CMD prefer calling the venv's binaries directly for faster, more reliable startup.
 
 **e) Verification — live end-to-end against deployed URL:**
 - GET `/health` → 200 OK.
@@ -227,3 +226,53 @@ All five components built, tested, verified, and deployed:
 **Status:** Phase 1 MVP COMPLETE and deployed.
 
 **Next phase:** Phase 2 — agentic layer. Add KYC/statement extraction skill and fraud-explainer skill. Introduce LangGraph supervisor agent to route between three specialist capabilities. Add groundedness/verifier agent. Introduce formal evaluation metrics. Recommend fresh planning conversation given multi-agent architecture scope shift from Phase 1's single-pipeline MVP.
+
+### 2026-08-08 — GitHub Publish, Licensing, Documentation Polish & Accuracy Audit
+
+**a) GitHub repository created and published:**
+- Executed: `gh repo create gcp-genai-banking-copilot --public --source=. --remote=origin --push` (created public GitHub repo, pushed Phase 1 complete code, set remote upstream).
+- Security pre-flight: verified no hardcoded secrets or keys in git history — the Gemini API key that was chat-leaked during pre-Component-5 session was rotated immediately (never committed), so no compromise in repo.
+- Added GitHub topics: `gcp`, `genai`, `gemini-api`, `rag`, `firestore`, `cloud-run`, `banking`, `portfolio`.
+
+**b) License and branding:**
+- Added MIT License file (`LICENSE`). Confirmed auto-detection by GitHub (shows MIT badge on repo).
+- Updated repo description: "Banking Document & Risk Intelligence Copilot — Filings RAG MVP on GCP Always-Free."
+
+**c) README rewritten (portfolio-quality):**
+- Replaced stale Component-1-era README with comprehensive documentation:
+  - Project overview (problem statement, use cases, Phase 1 MVP scope).
+  - Live demo link: `https://filings-rag-api-27353588174.us-central1.run.app`.
+  - Architecture diagram (markdown mermaid: data flow Cloud Storage → chunk → embed → Firestore → retrieval → generation).
+  - Tech stack section (FastAPI, Firestore, Gemini API, Cloud Run, docker, uv).
+  - API usage example (curl POST `/query` with real-world question, real response).
+  - Setup instructions (clone, uv sync, .env, local run, Cloud Run deploy).
+  - Future work (Phase 2 agentic layer).
+
+**d) Documentation consistency audit (CLAUDE.md & learnings.md):**
+- Executed full consistency audit as a subagent — found 5 stale-content issues:
+  1. Firestore.Vector import example (line ~305) showed wrong top-level import — corrected to show `from google.cloud.firestore_v1.vector import Vector`.
+  2. Embedding model example (line ~388) showed deprecated `text-embedding-005` — corrected to `gemini-embedding-001` with `output_dimensionality=768`.
+  3. Rate-limits section (lines ~354, 356) listed models as available that were later found inaccessible (`gemini-2.5-flash` 404, `text-embedding-005` sunset) — updated to reflect live-tested reality: `gemini-flash-latest` (working), with cross-references to Component 4's gotchas.
+  4. "To Be Added" placeholder (lines ~1319-1327) listed "LangChain & LangGraph Patterns" as pending, but section exists at lines 523–589 — removed from placeholder, kept legitimately-still-pending Phase 2 items.
+  5. Last-updated timestamp (line 1331) showed "Pre-Component 5" but Component 5 content was present — updated to "2026-08-08 — through Phase 1 completion."
+- Added new bridge section: "Phase 1 Component Build Log" (41 lines) at the top of learnings.md after the intro — concise chronological summary of what each component (1-5) built, which files/tech, relevant concept-section pointers, and status. Bridges CLAUDE.md session log to learnings.md concept reference structure.
+
+**e) Second-pass accuracy fix (this session):**
+- During the component build log creation, caught that the new Component 5 entry claimed "Alpine base, multi-stage" — verified against the real Dockerfile and corrected to `python:3.11-slim` base, `COPY --from` uv binary.
+- Second review of learnings.md "Component 5: Real Build Notes" section found the Dockerfile snippet itself was stale:
+  - Line 1319 showed `CMD ["sh", "-c", "uv run uvicorn ..."]` but should be `.venv/bin/uvicorn` (the actual fix documented in the gotcha paragraph directly below contradicted the snippet).
+  - Missing `USER appuser` line (added after initial root-only build).
+  - Corrected snippet and supporting prose to match the deployed file.
+- Cross-checked against CLAUDE.md and found matching errors that were never fixed after the initial session:
+  - Line 184: still claimed "Alpine base" — corrected to `python:3.11-slim`, COPY --from, two-layer uv sync, non-root appuser, direct venv binary.
+  - Line 190: used old flag `--set-env-vars=GEMINI_API_KEY=sm://gemini-api-key` — corrected to `--set-secrets=GEMINI_API_KEY=gemini-api-key:latest` (verified against learnings.md's own "Real Working Deploy Command").
+  - Lines 198–201: claimed 3 gotchas, but gotcha #3 ("Venv binary path resolution: `/venv/bin/python -m uvicorn...`") was fabricated/misremembered — the real fix was described in gotcha #2 (use `.venv/bin/uvicorn` directly, not `uv run`). Merged gotcha #3 into gotcha #2 with full detail; now 2 real gotchas only.
+
+**f) Commits:**
+- a2ff72a — `docs: add MIT license`
+- f84d559 — `docs: rewrite README as portfolio-quality project overview`
+- Both consistency audit fixes (5 stale items corrected, Component Build Log added, second-pass accuracy corrections) staged for this commit.
+
+**Status:** Phase 1 fully complete, documented, tested, deployed, licensed, published, and now doc-audited twice for accuracy. Ready for portfolio demo.
+
+**Next:** Phase 2 planning conversation (agentic layer, multi-skill supervisor, formal evaluation).
