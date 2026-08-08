@@ -4,9 +4,15 @@
 msg=$(git log -1 --pretty=%B)
 
 if echo "$msg" | grep -qi '\[component-done\]'; then
-    echo "═══════════════════════════════════════════"
+    echo "═══════════════════════════════════════════════════════════════════"
     echo " COMPONENT/PHASE MARKED DONE"
-    echo " → Run the CLAUDE.md + learnings.md update prompt"
-    echo "   in the doc-updates Claude Code session now."
-    echo "═══════════════════════════════════════════"
+    echo ""
+    echo " → Run the CLAUDE.md + learnings.md update prompt in doc-updates now."
+    echo ""
+    echo " → DOCUMENTATION ACCURACY PROTOCOL REMINDER:"
+    echo "   • Read real artifacts fresh (cat/git show), don't recall from memory"
+    echo "   • Single source of truth: learnings.md has detailed descriptions"
+    echo "   • CLAUDE.md session log references learnings.md, doesn't re-describe"
+    echo "   • Full audit due after 3 components? Check CLAUDE.md session log."
+    echo "═══════════════════════════════════════════════════════════════════"
 fi

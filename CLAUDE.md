@@ -53,6 +53,16 @@ A **supervisor agent** (LangGraph, Phase 2) routes requests to the right special
 - **New-session flags:** when a chunk of work is complete enough that the next component should start a **fresh Claude Code session** (to avoid context bloat and conserve the session window), the session-end log entry will explicitly say so — e.g. "Start new Claude Code session for: Firestore vector search setup."
 - **`learnings.md`** (maintained alongside this file, same directory): one section per service/concept — what it is, why it's used here, implementation snippets, and an ELI5 explanation with examples. Update this file after every session in which something new is learned or implemented. Quick reference for yourself and for Claude Code sessions.
 
+### Documentation Accuracy Protocol
+
+Prevent drift between CLAUDE.md and learnings.md:
+
+- **Single source of truth for artifacts:** Any technical artifact (Dockerfile, deploy command, config file, code snippet) gets ONE authoritative, detailed description — in learnings.md's relevant concept or "Real Build Notes" section. CLAUDE.md's session log references that location ("see learnings.md's X section") rather than re-describing the artifact in its own words. Never let the same fact exist as two independently-written prose descriptions across files.
+- **Read the real artifact fresh, every time:** Before writing or editing any description of a Dockerfile, deploy command, config, or code snippet, read the actual current file/command output directly (cat, git show, etc.) in that same session — never describe from memory of an earlier session, even one from earlier today.
+- **Cross-check before writing, when duplication is unavoidable:** If a fact must appear in both files (e.g. a brief summary in a bridge/index section), grep the other file for the same fact before writing, and confirm both descriptions agree.
+- **State "not yet verified" rather than guessing:** If asked to describe something not directly in view, say so and re-read the relevant file rather than filling in a plausible-sounding description.
+- **Recurring audit cadence:** Every 3 completed components, run a full consistency audit (search for stale TBD/placeholder language, cross-reference technical claims across both files, verify artifact descriptions against real files) before starting the next component. Track the last audit point in the session log so this isn't missed. Last full audit: Phase 1 final audit on 2026-08-08.
+
 ## Session Log
 
 ### 2026-08-05 — Project kickoff & GCP fundamentals
@@ -181,13 +191,13 @@ A **supervisor agent** (LangGraph, Phase 2) routes requests to the right special
 **a) Component 5 built — FastAPI HTTP API layer:**
 - Implemented `src/copilot/api.py`: POST `/query` (Pydantic request/response validation, structured error handling), GET `/health`, JSON error responses with status codes.
 - Implemented `app.py` (uvicorn entry point).
-- Created Dockerfile (`python:3.11-slim` base, `COPY --from` uv binary, two-layer `uv sync` for dependency caching, non-root `appuser`, direct `.venv/bin/uvicorn` in CMD).
+- Created Dockerfile. Full details (base image, layering, user config, CMD): see learnings.md "Component 5: FastAPI + Docker + Cloud Run — Real Build Notes".
 - Created `.dockerignore` (excludes git, tests, caches, local keys — smaller image, faster build).
 - **Design decision — strict grounding at HTTP boundary:** API response includes `answer_grounded` boolean; client code can distinguish answered-from-context vs. refused-out-of-scope without parsing model text.
 
 **b) Infrastructure & deployment model:**
 - **Service account reuse:** `filings-rag-app` already has all needed roles (Firestore, Storage, Secret Manager). No new identity created. Cloud Run attaches this SA as the pod identity; code uses `google.auth.default()` which detects Cloud Run environment and auto-authenticates — no key file in container.
-- **Secret injection:** `GEMINI_API_KEY` stored in Secret Manager; deployed with `--set-secrets=GEMINI_API_KEY=gemini-api-key:latest` (Cloud Run auto-loads at container startup). Verified secret permission check on startup.
+- **Secret injection & deploy command:** Full details (--set-secrets flag, environment setup): see learnings.md "Component 5: FastAPI + Docker + Cloud Run — Real Build Notes" section.
 - **Public deployment:** `--allow-unauthenticated` used for demo accessibility. Explicit decision — synthetic data only, safe for portfolio demo. Noted in commit message.
 
 **c) Cost & abuse safeguards:**
