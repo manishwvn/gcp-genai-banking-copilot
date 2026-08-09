@@ -37,6 +37,81 @@ Quick reference: what each component built and which concept sections explain th
 - **Live URL:** `https://filings-rag-api-27353588174.us-central1.run.app` (public, `--allow-unauthenticated`).
 - **Status:** Complete, deployed, live end-to-end verified (health check, grounded query, refusal query, OpenAPI docs all working).
 
+## Phase 1 End-to-End Pipeline Walkthrough
+
+> Example data in this walkthrough was captured live against the deployed service on 2026-08-08 — see raw JSON responses in git commit history for unmodified output.
+
+This section tells the story of what happens to a document and a question, start to finish—how PDF becomes answer with citations. The concept sections below explain each underlying technology in depth; this walkthrough shows how they connect and why each step exists.
+
+### The Starting Point
+
+Before anything: a PDF file sits in a folder, ignored. After Component 5 ships: a live URL answers questions about that PDF with real citations, no hallucination, no guessing.
+
+The journey: PDF → chunks → embeddings → vector index → retrieval pipeline → grounded generation → HTTP API → deployed.
+
+### Components 1–3: Turning a PDF into a Searchable Pile of Meaning
+
+**Ingestion & chunking (Component 1):**
+Raw PDF text is too broad. If you embed a whole 50-page 10-K filing as one vector, the vector captures only high-level gist—questions about specific financial metrics get lost. Solution: break text into ~800-token chunks (~3200 characters) at sentence boundaries, with 100-token overlap between adjacent chunks. Why overlap? A fact often spans chunk edges. Without overlap, retrieval misses context that lives in the seam. With it, no answer is ever "incomplete due to boundary."
+
+`chunk_text()` in `document_ingestion.py` handles this: feeds sentences into a buffer, spills to a chunk when size exceeds 800 tokens, seeds the next chunk's buffer with the last 100 tokens from the one that just spilled. Result: a collection of overlapping passages, each grounded in the original text, each self-contained enough to be understood alone.
+
+**Embedding (Component 2):**
+Each chunk gets embedded into a 768-dimensional vector using Gemini's `gemini-embedding-001` model. A vector is just 768 numbers. What do they represent? Semantic meaning. Two chunks about "debt obligations" will have similar vectors; two about "debt" and "weather" will not. The vector isn't keywords or words at all—it's a high-dimensional fingerprint of meaning that the model learned.
+
+`embed_text()` calls `client.models.embed_content()` with `output_dimensionality=768`. One call per chunk. Why Gemini's embedding, not a separate open-source model? It's free-tier accessible, needs no management, and stays in the same semantic space as the generation model we'll use later (Component 4). Consistency matters: if the embedding model and generation model "speak different languages," retrieval and generation get misaligned.
+
+**Indexing (Component 3):**
+Firestore can search millions of vectors instantly using a native KNN index—but only after you build it explicitly. Create a composite index on the `embedding` field (768 dimensions, cosine distance). This isn't a data-processing step (no code to write), but it's essential infrastructure. Without it, `find_nearest` fails silently. Think of it like a card catalog in a library: without the index, the librarian has to read every card to find your request. With it, lookup is O(log n).
+
+### Component 4: The Actual Brain—Retrieval + Grounded Generation
+
+Walk through a real example end to end. The question: "What are ACME's main financial risks mentioned in the filing?"
+
+**Step 1: Embed the question.**
+`retrieve_relevant_chunks()` takes the question and runs it through `embed_text()`—the same embedding model as the chunks. This produces a 768-dimensional query vector in the same semantic space. The question and the chunks now speak the same language.
+
+**Step 2: Find nearest neighbors.**
+`find_nearest()` (Firestore's native KNN search) compares the query vector against all 768-dim chunk vectors using cosine distance. It returns the top results ranked by relevance. Cosine distance: a number between 0 and 1, where 0 = identical meaning, 1 = orthogonal/opposite. Lower distance = higher relevance.
+
+Live example on the ACME financial risks question: retrieval returned 2 chunks (all chunks currently in the sample dataset — top_k=4 was configured, but only 2 chunks exist in Firestore from the single ingested sample filing):
+- chunk_index=0, distance=0.2366 (high relevance)
+- chunk_index=1, distance=0.3828 (good relevance)
+
+These chunks contain Item 1A risk factor disclosures from the sample 10-K filing. The distances are low enough that retrieval found useful context to feed to generation.
+
+**Step 3: Build a grounding prompt.**
+`_build_prompt()` constructs the precise prompt sent to Gemini. Core text: "Answer ONLY using the provided context. If the answer is not present in the context, respond exactly: 'I don't have enough information in the available documents to answer this.' Do not use outside knowledge."
+
+Then it lists the retrieved chunks as numbered context blocks: "[1] first chunk text. [2] second chunk text..." Then the question. This design forces the model into a choice: answer from what's in the context and cite which blocks [1], [2], etc., or refuse. No middle ground where it hallucinates.
+
+**Step 4: Generate with the model.**
+`generate_grounded_answer()` calls `client.models.generate_content()` with the prompt. The model reads the context and question, generates an answer. Real example (ACME financial risks question): the model generated:
+
+"According to the provided context, ACME's main risk factors mentioned under Item 1A in the filing are: Credit Risk (borrower default risk on loan portfolio, particularly in commercial real estate) [1]; Interest Rate Risk (Federal Reserve rate changes affecting net interest margin and securities value) [1]; Cybersecurity Risk (cyberattacks, data breaches, system failures) [1]; Regulatory Risk (Basel III capital requirement changes) [1]; Liquidity Risk (dependence on deposits and wholesale funding, risk of sudden withdrawal) [1], [2]."
+
+The model references context blocks [1] and [2] where it found each risk cited. Grounded, specific, no invented risks.
+
+**Step 5: Attach citations programmatically.**
+Here's the key design difference: citations are NOT extracted from the model's generated text. Instead, they're constructed in code from the retrieval-step metadata. Each of the retrieved chunks becomes one citation: `{source, chunk_index, distance}`. The model's references ([1], [2]) are a hint for humans; the authoritative citations come from what was actually fed into the prompt.
+
+Why this design? The model cannot fabricate sources. It cannot claim it cited a source that wasn't in the retrieval results. Citations are grounded by construction.
+
+**Step 6: The answer_grounded flag.**
+After generation, code checks: did the model refuse (return the exact refusal text) or answer? If it answered, `answer_grounded=True`. If it refused, `answer_grounded=False`. Both paths can have a citations list (non-empty if chunks were retrieved, empty if retrieval found nothing). This boolean disambiguates two scenarios: (1) answered from context (citation list says which chunks), vs. (2) searched but found no usable context (citation list is empty, answer is the refusal text).
+
+Example refusal (ACME filing, question "What is the population of Tokyo?"): Retrieval returns chunks from the 10-K with COSINE distances 0.5502 (chunk_index=1) and 0.5505 (chunk_index=0)—very weak matches (high distance numbers). The model reads these financial-risk chunks and sees no path to answering about Tokyo's population. It returns the refusal text exactly: "I don't have enough information in the available documents to answer this." Result: `answer_grounded=False`, `citations=[{chunk_index=1, distance=0.5502}, {chunk_index=0, distance=0.5505}]`, answer is the refusal. The API caller knows: not a hallucination, just out of scope. The high-distance citations prove retrieval tried but found nothing useful.
+
+### Component 5: Making It Reachable
+
+Components 1–4 live in Python. Component 5 wraps them in HTTP. POST `/query` endpoint takes a JSON request `{question: "..."}`, validates it with Pydantic, calls `rag_query()` (the end-to-end orchestrator), and returns `{answer, citations, answer_grounded}` as JSON.
+
+Infrastructure for Component 5: see learnings.md "Component 5: FastAPI + Docker + Cloud Run — Real Build Notes" section for full deployment details. Summary: Dockerfile packages the Python app, `gcloud run deploy` pushes it to Cloud Run. Service account identity (no key files in container) authenticates to Firestore and Secret Manager at runtime. Live at `https://filings-rag-api-27353588174.us-central1.run.app`.
+
+### The Full Line, One More Time
+
+PDF comes in → extracted to text → chunked with overlap → each chunk embedded to a 768-dim vector → vectors indexed in Firestore → question arrives at HTTP endpoint → question embedded with same model → Firestore finds nearest chunks (distances 0.24–0.38 for good matches, 0.55+ for weak ones) → chunks + question fed to Gemini with strict "answer only from context" prompt → Gemini generates answer or refuses → citations attached from retrieval metadata with distances, not from model text → response sent back as JSON with `answer_grounded` flag. Complete pipeline, zero hallucination by design, every citation grounded in actual retrieved text and ranked by distance.
+
 ---
 
 ## GCP Fundamentals — Projects, Billing, and `gcloud` CLI
