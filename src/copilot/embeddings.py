@@ -1,4 +1,5 @@
 """Gemini embedding generation (Phase 1 RAG pipeline)."""
+import math
 import os
 import time
 
@@ -40,7 +41,10 @@ def embed_text(text: str) -> list:
                 contents=text,
                 config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIM),
             )
-            return response.embeddings[0].values
+            values = response.embeddings[0].values
+            # gemini-embedding-001 doesn't auto-normalize when output_dimensionality < 3072 — normalize manually.
+            norm = math.sqrt(sum(v * v for v in values))
+            return [v / norm for v in values]
         except Exception as e:
             last_error = e
             if attempt < MAX_RETRIES - 1:

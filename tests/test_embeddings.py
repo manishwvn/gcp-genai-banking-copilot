@@ -1,3 +1,4 @@
+import math
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -5,9 +6,9 @@ import pytest
 from src.copilot import embeddings
 
 
-def _fake_response(dim=768):
+def _fake_response(dim=768, values=None):
     embedding = MagicMock()
-    embedding.values = [0.1] * dim
+    embedding.values = values if values is not None else [0.1] * dim
     response = MagicMock()
     response.embeddings = [embedding]
     return response
@@ -59,6 +60,20 @@ def test_embed_text_raises_after_max_retries(monkeypatch):
                 embeddings.embed_text("some filing text")
 
     assert mock_client.models.embed_content.call_count == embeddings.MAX_RETRIES
+
+
+def test_embed_text_returns_unit_norm_vector(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    mock_client = MagicMock()
+    # non-uniform, non-unit-norm raw values to exercise real normalization
+    raw_values = [0.05 * (i + 1) for i in range(embeddings.EMBEDDING_DIM)]
+    mock_client.models.embed_content.return_value = _fake_response(values=raw_values)
+
+    with patch("src.copilot.embeddings.genai.Client", return_value=mock_client):
+        result = embeddings.embed_text("some filing text")
+
+    norm = math.sqrt(sum(v * v for v in result))
+    assert 0.999 <= norm <= 1.001
 
 
 def test_embed_text_missing_api_key_raises(monkeypatch):
