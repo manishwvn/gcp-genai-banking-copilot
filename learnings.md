@@ -1007,6 +1007,69 @@ This project uses dense, learned vectors stored in Firestore. But the embedding 
 
 ---
 
+## Component 3: Vector Indexing — Concepts
+
+**What:** A database index is a data structure that accelerates queries at the cost of extra storage and slightly-slower writes. **Why it exists:** lookup by meaning in vector space is fundamentally different from traditional database queries, requiring its own specialized index type.
+
+### The Space/Speed Tradeoff (Index Fundamentals)
+
+Start with a concrete non-vector example: you manage a customer database with 1 million records, and users frequently ask "find the customer with email john@example.com." Without an index, the database must scan all 1 million records sequentially, checking each email. With an email index, the database maintains a sorted lookup structure (typically a B-tree) alongside the raw table — new writes are slightly slower (the index must be updated), and storage doubles, but lookups now jump to the right record in O(log n) time instead of O(n). Trade space and write-cost for read-speed.
+
+**Vector indexes are more complex:** normal indexes work because values have a natural sort order (email addresses are strings, sortable alphabetically). But vectors have no single meaningful sort order for "closeness to an arbitrary future query vector." Finding nearest neighbors is a genuinely different computational problem. Binary search doesn't help — you can't ask "is the query closer to vector 1 or vector 2 at the midpoint" and then eliminate half the space. This is why vectors need a specialized index.
+
+### Why Firestore's Vector Search Needs an Index (Hard Precondition, Not Optimization)
+
+In traditional SQL, an unindexed query runs slowly but still works — the database falls back to a full table scan. **Firestore vector search has no such fallback.** A `find_nearest` query *fails outright* if the index doesn't exist or is still being built — it's a hard precondition, not just a performance optimization. This is a crucial distinction and a gotcha for developers used to SQL's graceful degradation.
+
+The reason: exact nearest-neighbor search over millions of vectors (without an index) would be computationally prohibitive — compare the query against every single stored vector, every time. Most production systems avoid this via approximate algorithms (see Vector Fundamentals' discussion of HNSW), which trade tiny accuracy loss for speed. Firestore's approach: require the index upfront, enforcing the platform's architectural expectations.
+
+### Our Index: Field-by-Field Breakdown
+
+Here's the command used in this project:
+
+```bash
+gcloud firestore indexes composite create \
+  --collection-group=filings_chunks \
+  --query-scope=COLLECTION \
+  --field-config field-path=embedding,vector-config='{"dimension":"768", "flat": "{}"}' \
+  --database="(default)"
+```
+
+Each parameter:
+- **`--collection-group=filings_chunks`:** The specific collection this index applies to. Vector indexes are per-collection, not global — if you add a new vector-bearing collection in Phase 2 (e.g., `kyc_documents`), it needs its own separate index.
+- **`--query-scope=COLLECTION`:** Scopes to this collection only (vs. collection-group queries that span subcollections — not used in our flat document structure, but the parameter must be present).
+- **`field-path=embedding`:** Which field in the document holds the vector. If a single collection had multiple vector fields (rare, but possible), you'd need a separate index for each.
+- **`"dimension":"768"`:** Locks the index to exactly 768-dimensional vectors. This must match Component 2's `output_dimensionality=768` setting — a direct link between embedding generation and indexing. Every stored vector and every query vector must be 768-dim; a mismatch causes queries to fail.
+- **`"flat": "{}"`:** The algorithm type — "flat" is Firestore's term for **exact nearest-neighbor search**. This connects to the "Exact KNN vs. Approximate Nearest Neighbor (ANN)" concept already discussed in Vector Fundamentals (line ~1002) — flat means exhaustive comparison against every indexed vector, no shortcuts. The tradeoff: perfect accuracy at our small scale (handful of chunks), but wouldn't scale to millions of vectors (why production systems use HNSW or similar approximate methods).
+
+### Async Index Creation & State Machine
+
+Index creation is not instantaneous — it's a background build process. Firestore reads through all existing data in the collection and constructs the search-optimized structure. Duration scales with data volume; at our project's scale (a couple of documents), it's effectively instant, but at production scale (millions of documents), it can take minutes to hours.
+
+**Index state distinction — why it matters:** An index can be in several states: `CREATING` (being built), `READY` (available), or rare error states. Here's the critical distinction from SQL: a query against a still-CREATING index doesn't run slowly — **it fails outright.** Contrast with SQL: an unindexed query usually still executes (just slowly via full scan). Firestore has no graceful degradation. Check index status via `gcloud firestore indexes composite list` before expecting queries to work.
+
+**Why async matters architecturally:** At deployment time (e.g., Cloud Run), the code can start immediately and begin handling requests. But `find_nearest` queries will fail until the index finishes building. Production applications often pre-create indexes (via Infrastructure as Code, e.g., Terraform) *before* deploying the application, avoiding this window. We didn't encounter this in Phase 1 because index creation was fast and manual, but it's worth knowing for Phase 2 when automation scales.
+
+### Component 3 Architectural Distinctness (Infrastructure vs. Data Processing)
+
+Components 1–2 were **data processing** — code that transforms or writes data (PDF extraction, chunking, embedding generation). Component 3 was **infrastructure/platform provisioning** — an administrative command that changes what the *database itself* is capable of, not the data. Which is why it produced zero new code files despite being non-optional.
+
+This distinction matters: data processing is repeatable (re-run chunking on new docs), versioned (commit the code), and testable (unit tests). Infrastructure provisioning is one-time per collection (or per version of the index), idempotent (creating the same index twice is a no-op), and managed via configuration or CLI, not application code. Merging them is a common mistake — treating index creation as "data pipeline logic" instead of "infrastructure setup."
+
+### Phase 2 Forward: Per-Collection Vector Indexing
+
+Each new vector-bearing collection introduced in Phase 2 will need its own separate composite vector index. Example collections expected in Phase 2:
+- `kyc_documents` (for KYC extraction skill) — would store structured extracted fields + a vector field for semantic search over document text.
+- `fraud_flags` or a `compliance_policies` collection (for fraud explainer skill) — similarly, vectors for policy/transaction-description matching.
+
+Each collection + vector field pair requires its own index command, applying the same pattern but with different `--collection-group` and possibly different `field-path` values. This isn't a one-time database setup; it's a per-collection-per-vector-field requirement. Useful to remember when scoping Phase 2 component work so index creation isn't rediscovered as a surprise blocking queries.
+
+### ELI5
+
+A vector index is like pre-sorting a warehouse's inventory by "what's physically near what" instead of just by arrival order — so when someone asks "what's near this spot," you don't have to walk past every single shelf, you can jump straight to the right neighborhood. But the sorting only works if someone actually did the organizing work upfront; if you haven't organized yet, you're stuck with an exhaustive walk.
+
+---
+
 ## Retrieval & Grounded Generation (RAG Chain)
 
 **What:** Combining semantic retrieval (find the most relevant filing chunks for a question) with constrained generation (make the model answer only from those chunks). Two-stage pipeline: `retrieve_relevant_chunks()` embeds the question and runs `find_nearest` against Firestore; `generate_grounded_answer()` feeds the retrieved text into a tightly-scoped prompt and attaches citations in code.
