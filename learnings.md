@@ -1076,6 +1076,73 @@ A vector index is like pre-sorting a warehouse's inventory by "what's physically
 
 **Why:** Grounding prevents hallucination. Left alone, an LLM will answer confidently from parametric knowledge even when the real filing says nothing on the topic — dangerous in a banking-domain interview demo. Two separate guardrails matter here: (1) a prompt instruction telling the model to refuse when the context doesn't cover the question, and (2) citations attached programmatically from the actual retrieved chunk metadata, not parsed/trusted from the model's own `[1]`-style references in its text. The model can lie about what it used; the retrieval code can't.
 
+### How Text Generation Actually Works (Under the Hood)
+
+Understanding why grounding is necessary — and how the retrieval context actually influences the model's output — requires understanding the generation process itself. It's fundamentally different from embedding.
+
+**Encoder vs. Decoder: Architectural Contrast**
+
+Embeddings (Component 2, gemini-embedding-001) and generation (Component 4, gemini-flash-latest) use the same foundational Transformer architecture but in completely different modes. **Embeddings are encoders:** they read the entire input passage at once (bidirectional attention — every token sees every other token simultaneously, in both directions) and produce a single summary vector for the whole passage. Think of it as: "I read the entire chapter, now summarize its meaning in 768 numbers." **Generation is an autoregressive decoder:** it produces the answer **one token at a time, left to right**, and uses **causal (one-directional) attention** — when generating token N, it can only attend to the prompt plus tokens 1 through N-1. It cannot look ahead at its own future output. This is a fundamentally different computation, not a scaled-up version of embedding.
+
+**The Autoregressive Generation Loop, Mechanically**
+
+Here's how generation actually works step-by-step:
+
+1. The model is given the full prompt: the grounding instructions, the retrieved context blocks, and the question. Let's say this prompt is 1,000 tokens total.
+2. The model's attention mechanism processes all 1,000 tokens of the prompt simultaneously, to establish context. Unlike embedding (which stops here with a summary vector), generation continues:
+3. The model predicts the next token — the most likely first token of the answer. This prediction is based on the full 1,000-token prompt (causal attention sees everything in the prompt). The model outputs that token (e.g., "The").
+4. That predicted token is **appended to the prompt**. The prompt is now 1,001 tokens.
+5. Step 3 repeats: predict the next token using the 1,001-token sequence (prompt + generated token so far), output it, append.
+6. This loop continues until a stop condition is met (e.g., the model generates a token indicating end-of-response, or a token-limit is reached).
+
+The key insight: **at every step, the model re-attends to the entire sequence so far**, including the retrieved context. The context is not read once and discarded — it's continuously re-attended to, influencing every token prediction. This is why the grounding prompt technique works: the instruction "Answer ONLY using this context" is embedded in tokens 1–100 of every prediction's input, and causal attention ensures it stays present and influential across the entire generation.
+
+**Why Retrieved Context Remains Influential Across the Entire Generation**
+
+Because of causal attention re-attending at every token position, the retrieved context doesn't have a "window" after which it's forgotten. Token 1 of the answer is predicted from the full prompt + 0 prior-generated tokens. Token 100 of the answer is still predicted from the full prompt (including all the context blocks) plus tokens 1–99 of the answer. The prompt context never goes out of scope — it's part of the input at every prediction step. This is the mechanical foundation for why grounding works at all; it's not a hope-this-works prompt trick, it's a consequence of how causal attention functions.
+
+**Refusal is Learned, Probabilistic Instruction-Following — Not a Hard Guarantee**
+
+The exact refusal string `"I don't have enough information in the available documents to answer this."` that appears in the grounding prompt — when the model actually outputs that string, it's not because something mechanically forced it to. It's because the model, during instruction-tuning (a training phase using massive datasets of (prompt-instruction, desired-output) pairs), learned to follow the instruction "if you don't have enough info, say this exact string." This is learned, probabilistic behavior.
+
+**Critical distinction from programmatic citations:** Our citation attachment is a hard guarantee built in code. We retrieve chunks, we send them to the model, and we attach the citation metadata (source, chunk index, distance) to the response regardless of what the model says — it's a code-driven guarantee. The refusal behavior is different — it's a trained tendency the model usually but not always follows. Models can and do break instruction-following in various contexts; they can refuse when they shouldn't, fail to refuse when they should, or even misunderstand the instruction. The prompt-based grounding is necessary but, as the existing code comment notes, "not sufficient." This is precisely why programmatic citations exist as the **real** safety layer — they don't rely on the model's probabilistic behavior.
+
+**Separate, Independent Quota Pools: embed_content vs. generate_content**
+
+The Gemini API has a single free tier but **different per-endpoint quota pools**. `embed_content` (used in Component 2 for embedding generation) and `generate_content` (used in Component 4 for grounded generation) draw from separate free-tier quota limits, even under the same API key and project. This project encountered both evidence directly:
+
+- Component 2: `embed_content` calls worked fine, consistently, on the free tier.
+- Component 4: `generate_content` calls initially failed for `gemini-2.0-flash-001` with a 429 error explicitly stating `limit: 0` on `generate_content_free_tier_requests`, meaning zero free-tier quota for that model's generation endpoint. Embeddings worked, generation did not — separate pools.
+
+See the gotchas section (line ~1116–1126) for the full error details and the distinction between this model-specific zero-quota scenario vs. the account-level access restriction (`gemini-2.5-flash`'s 404). The generalization: **separate, independent quota pools per endpoint. Always verify that the model you've chosen for generation has nonzero free-tier quota via a live API call; `ListModels` only says the model exists, not that your tier can use it.**
+
+**Temperature and Sampling: Generation is Probabilistic, Not Deterministic**
+
+Generation doesn't work by picking "the most likely next token" deterministically at every step. A temperature parameter controls randomness in token selection:
+
+- **Low temperature** (e.g., 0.1) → more deterministic, repeatable responses ("safe" for banking).
+- **High temperature** (e.g., 1.0+) → more varied, creative responses, occasionally nonsensical.
+
+This project uses default settings (no explicit temperature tuning), meaning Gemini's built-in defaults apply. **Worth noting for Phase 2:** a banking system wanting consistency and predictability would likely benefit from deliberately low temperature — a real lever currently untuned. This isn't a gotcha or a bug; it's an available parameter to consider when generation quality or consistency becomes a concern.
+
+**Context Window and Token Budget: A Real, Currently-Dormant Constraint**
+
+Every `generate_content` call has a maximum total token budget covering the prompt plus the response combined. For gemini-flash-latest, this is several thousand tokens. At current scale (2 retrieved chunks, short prompts, short answers), this is a non-issue. But as Phase 2 grows — adding `top_k=10` to retrieve more chunks, or running against the full SEC filing corpus instead of hand-picked samples — the total tokens in (prompt + chunks) could approach this limit, forcing either fewer retrieved chunks (worse answer quality) or truncation of chunks (losing relevant context). This is a genuine scaling concern, not yet encountered, but worth understanding as a real constraint (not a server rate-limit or quota, but a hard architectural limit on token budget per call).
+
+**Hallucination: Precise Technical Definition**
+
+The existing section (line 1077) mentions "grounding prevents hallucination," but the term deserves a precise definition rather than surface-level use. **Hallucination is fluent, confident output that is not actually supported by the model's input or grounding.** It arises naturally and inevitably because autoregressive generation is fundamentally a **probability process** — at every step, the model is predicting "what token is statistically likely to come next given this input," not "is this fact actually true?" Statistically likely tokens and factually correct tokens are not the same thing. A model can fluently predict text about, say, financial risks that don't actually appear in the retrieved documents, because the model's training data happened to associate certain tokens with plausible-sounding financial language. This isn't a bug or a model failure — it's a direct consequence of how generation works at all. This entire system's architecture (strict grounding prompt, programmatic citation attachment, the `answer_grounded` boolean flag) exists specifically to constrain and audit against this tendency, but it does not eliminate the underlying mechanism that causes it.
+
+**Formal RAG Evaluation: Deferred to Phase 2 with Substance**
+
+The existing brief mention (line 1084) correctly notes that formal evaluation is Phase 2 scope. Here's what that actually means, not yet done:
+
+- **Retrieval evaluation:** precision and recall on retrieval. Build a labeled test set of (question, correct-chunk-id) pairs, run retrieval on each question, check whether correct chunks appear in top-k results. Measure: precision@4 (did all retrieved chunks actually match?), recall (did we find all relevant chunks?).
+- **Faithfulness / groundedness scoring:** does the generated answer's actual factual content match what's in the retrieved/cited chunks? Manual spot-checking (as done this phase) doesn't scale. Systematic evaluation would involve either human annotation of (answer, chunks, is-answer-faithful?) triplets for statistical confidence, or using an LLM-as-judge (a separate model scoring whether the answer stays grounded). Tools like RAGAS (a framework for automated RAG evaluation) provide metrics like "answer relevance," "faithfulness," and "context relevance" — essentially automating these checks.
+- **What we have now:** empirically, the system works on manual spot-checks (one grounded query, one refusal query, both correct). What we don't have: confidence that it generalizes (maybe those two examples were lucky), measurement of false-positive refusals (do we refuse usable questions?), or repeatability (do we answer identically to identical questions, or does temperature randomness create variance?).
+
+The distinction: grounded by design (architecture prevents certain hallucination classes) ≠ grounded by measurement (we've quantified how often hallucination actually occurs, under what conditions). Phase 2 will close that gap.
+
 **Key concepts:**
 - *Distance/similarity scores* — `find_nearest` with `DistanceMeasure.COSINE` returns cosine distance (lower = more similar). Surfacing this in citations gives transparency into how confident the match was, useful for debugging bad retrieval before blaming generation.
 - *top_k tradeoffs* — more chunks = more context = costlier prompt + more chance of irrelevant text diluting the answer; too few chunks = real answer might be split across chunks not retrieved. `top_k=4` picked as a reasonable default for short filing excerpts; tune per corpus.
