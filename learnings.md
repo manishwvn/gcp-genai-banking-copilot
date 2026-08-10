@@ -380,7 +380,7 @@ A managed NoSQL database (document/collection model). Data is stored as **docume
 
 ### Why It's Used Here
 - **Phase 1:** Store document metadata (title, source, upload date) and their embeddings (vectors).
-- **Phase 2:** KYC extraction results, flagged transactions, and verification audit logs.
+- **Phase 2:** KYC extraction results, flagged transactions, and verification audit logs. In an agentic architecture, Firestore's role expands beyond single-purpose RAG storage to become **shared memory across multiple agents** — the supervisor, KYC-extraction, and fraud-explainer agents can all read/write the same Firestore project using their own collections (e.g. `kyc_documents`, `fraud_flags`) alongside `filings_chunks`. Firestore's flexible document model also suits persisting evolving agent state (what's been retrieved, what tools have run, intermediate results) between steps in a LangGraph flow — no new infrastructure needed, same database, more collections and consumers.
 - **Vector search:** Query documents by semantic similarity — the core of RAG retrieval.
 - **Always-Free tier:** 1 GiB storage, 50K reads / 20K writes / 20K deletes per day — plenty for an MVP.
 
@@ -388,13 +388,25 @@ A managed NoSQL database (document/collection model). Data is stored as **docume
 
 **Document:** A single record (like a row in SQL). Contains fields (key-value pairs). Docs are versioned and timestamped.
 
-**Collection:** A grouping of documents (like a table). Can be top-level or nested under another document (subcollections).
+**Collection:** A grouping of documents (like a table). Can be top-level or nested under another document (subcollections). Unlike a SQL table, a Firestore collection enforces no fixed schema — two documents in the same collection can have entirely different fields.
 
 **Vector field:** A field that stores a dense embedding (list of floats). Firestore indexes these for KNN (K-nearest neighbor) search. Dimension can be up to 2048 (common: 768 for many embedding models).
 
-**Vector search:** Query: "Find docs similar to this vector." Firestore returns the K closest neighbors by distance (cosine, Euclidean, dot product).
+**Vector search:** Query: "Find docs similar to this vector." Firestore returns the K closest neighbors by distance (cosine, Euclidean, dot product). Cosine distance measures the **angle** between two vectors (semantic direction), not their magnitude/length — two vectors pointing in a similar "direction" in meaning-space have low distance (0 = identical) regardless of how long either vector is. In this project: real example distances were 0.2366 (high relevance), 0.3828 (good relevance), and 0.5502–0.5505 (weak/irrelevant matches).
 
 **Real-time listeners:** You can subscribe to live updates — if a document changes, your app is notified immediately.
+
+### How to Query Firestore
+
+Firestore can be accessed via three different paths, each with different capabilities:
+
+| Access Path | What it does | What it CANNOT do |
+|---|---|---|
+| **GCP Console** | Browse documents; apply simple equality/range filters via Data tab query builder | Vector similarity search (`find_nearest`); complex queries |
+| **gcloud CLI** | Manage infrastructure: create/delete databases, create vector indexes, check index status, manage backups | Query document data at all — gcloud is infrastructure/admin only, not for reading app data |
+| **Application code (Python client library)** | Full query power: simple `.where()` filters, complex `find_nearest()` vector similarity search, transactions | None — this is the most capable path |
+
+**Important:** A common gotcha is trying to query data via `gcloud` CLI (e.g., `gcloud firestore documents list`). While this command *looks* like it should work, `gcloud` is fundamentally an infrastructure management tool, not a data-query tool. For actual data access, always use application code (Python client library) or the Console UI for simple browsing.
 
 ### Implementation Snippets
 
@@ -447,6 +459,44 @@ Firestore is like **a smart filing cabinet that understands meaning.**
 2. **Reads/writes are charged per document, not per field.** Reading one field from 100 docs = 100 read ops, not 1.
 3. **Real-time listeners consume reads.** A live subscription that updates every second = 86,400 reads per day. Good for apps, bad for your quota if you're not careful.
 4. **Nested documents don't rollover queries.** If you query a parent collection, you don't automatically get subcollection data.
+5. **`distance_result_field` parameter is required for distance scores.** When running `find_nearest`, include `distance_result_field="distance"` in the query to get the similarity score back on each returned document — without it, results only contain the stored fields and no distance metric, making it impossible to gauge retrieval confidence.
+
+### Firestore vs. SQL / Relational Databases
+
+**Key architectural difference:** SQL databases (like PostgreSQL, Cloud SQL) enforce a **fixed schema** — every row in a table has the same columns, with the same data types. Relationships between tables happen via formal joins and foreign keys. Firestore has no fixed schema and no formal inter-table relationships; each document in a collection can have different fields, and collections are isolated from each other.
+
+**Why this matters:**
+- **SQL strength:** If you need consistent structure, data integrity via foreign keys, and complex queries across multiple tables (joins), use SQL.
+- **Firestore strength:** If your data shape varies (e.g., different documents hold different fields), or if you need schema flexibility as your app evolves, Firestore is simpler.
+- **SQL doesn't apply:** Firestore can't run SQL because SQL's core operations (joins, aggregations across tables, enforced schema) don't map onto a document/collection model. This is architectural, not a missing feature.
+
+**Path to SQL if you need it:** GCP offers two SQL-native options for when you need traditional SQL querying:
+1. **Cloud SQL** — fully managed PostgreSQL/MySQL — use if your app needs relational structure from day one.
+2. **BigQuery** — serverless data warehouse — use if you need SQL-style analytics over Firestore data. Firestore supports **export/sync to BigQuery**, which mirrors your Firestore collections into BigQuery tables; you then run SQL queries against the mirror for reporting/analytics, while your live app keeps using Firestore's flexibility and real-time updates.
+
+**ELI5:** SQL table = identical printed form everyone fills out (fixed columns). Firestore document = a folder where each one can hold different pages/fields. You can photocopy all your Firestore folders into a ledger (BigQuery) and do accounting (SQL) on the ledger without changing the folders.
+
+### Navigating Firestore in the GCP Console (Aug 2026)
+
+Console path: **Databases** (left sidebar under Data) → select your database name → four tabs:
+
+**Data tab:**
+- Browse all collections and their documents.
+- Vector fields are visually distinguished from regular scalar fields in the document view.
+- Simple query builder at top: equality and range filters (NOT vector search — that requires Python code).
+- Click a document to view/edit its fields inline.
+
+**Indexes tab:**
+1. **Automatic** — indexes Firestore creates on your behalf for simple scalar-field queries (equality, range). Status shown as built or building; refresh the tab to see status updates.
+2. **Manual** — indexes you create explicitly for complex queries (composite indexes across multiple fields) AND all vector indexes for `find_nearest`. Vector indexes appear here listed by collection and field.
+3. Creating a vector index via Console UI: **Manual tab** → **Create Index** button → Collection: `filings_chunks` → add Field: `embedding` (type: Vector, dimension 768, distance: COSINE) → Create Index. Takes a few minutes; refresh the Indexes tab to see status update.
+
+**Usage tab:**
+- Read/write/delete operation counts for the day (resets daily). Compare against your Always-Free quotas (50K reads, 20K writes, 20K deletes/day).
+- Useful for spotting quota overages or expensive queries before they consume your limit.
+
+**Rules tab:**
+- Security rules for client-side Firebase SDK access (e.g., mobile app using Firebase). Less relevant for server-side-only access patterns (your app authenticated via service account). Reference for context, but not used in Phase 1.
 
 ---
 
@@ -827,7 +877,10 @@ sentences = re.split(r"(?<=[.!?])\s+", text.strip())
 ```
 
 ```python
-# Firestore chunk document
+# Firestore chunk document (filings_chunks collection)
+from google.cloud.firestore_v1.vector import Vector
+from datetime import datetime, timezone
+
 collection.add({
     "text": chunk,
     "source": source_name,
@@ -835,6 +888,7 @@ collection.add({
     "page_number": 0,
     "chunk_index": index,
     "created_at": datetime.now(timezone.utc),
+    "embedding": Vector([0.123, 0.456, -0.789, ...]),  # 768-dim vector, computed externally
 })
 ```
 
@@ -854,6 +908,8 @@ collection.add({
 **What:** Converting text (a chunk of a filing) into a dense vector — a fixed-length list of floats — that numerically represents its meaning.
 
 **Why:** Enables retrieval by meaning, not keyword matching. A query about "credit risk exposure" should match a chunk discussing "loan default risk" even with zero shared words, because their embeddings land close together in vector space.
+
+**Critical:** Firestore does not generate embeddings itself — it has no AI model built in. Embedding generation happens entirely externally (via the Gemini API in this project); Firestore's role is purely to store the resulting vector and make it searchable via `find_nearest`.
 
 **Key concepts:**
 - **Embedding dimension** — fixed length of the vector (768 here). Firestore's vector index is dimension-locked; the index and every stored vector must match.
